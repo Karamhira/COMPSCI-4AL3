@@ -4,12 +4,18 @@
 import torch
 import torch.nn as nn
 from torch.utils.data import Dataset, DataLoader
-from transformers import BertTokenizer, BertModel, AdamW, get_linear_schedule_with_warmup
+from transformers import BertTokenizer, BertModel, get_linear_schedule_with_warmup
+from torch.optim import AdamW
 from sklearn.preprocessing import LabelEncoder
 from sklearn.model_selection import train_test_split
 from sklearn.metrics import f1_score
 import pandas as pd
 import gc
+
+
+df = pd.read_csv("./dataset/MN-DS-news-classification.csv")  # <-- this creates df
+df['text'] = df['title'].fillna('') + " " + df['content'].fillna('')
+df['text_len'] = df['text'].apply(lambda x: len(str(x).split()))
 
 # -------------------------
 # Dataset class

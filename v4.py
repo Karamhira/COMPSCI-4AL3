@@ -107,7 +107,7 @@ model = HierarchicalBERT(num_labels_lvl1=len(le_lvl1.classes_),
 # Optimizer, scheduler, loss
 # -------------------------
 optimizer = AdamW(model.parameters(), lr=2e-5)
-epochs = 5
+epochs = 15
 train_steps = len(train_loader) * epochs
 scheduler = get_linear_schedule_with_warmup(optimizer, num_warmup_steps=0, num_training_steps=train_steps)
 criterion = nn.CrossEntropyLoss()
@@ -118,7 +118,8 @@ criterion = nn.CrossEntropyLoss()
 for epoch in range(epochs):
     model.train()
     total_loss = 0
-    for batch in train_loader:
+    print(f"\n===== Epoch {epoch+1}/{epochs} =====")
+    for i, batch in enumerate(train_loader):
         optimizer.zero_grad()
         input_ids = batch['input_ids'].to(device)
         attention_mask = batch['attention_mask'].to(device)
@@ -135,17 +136,22 @@ for epoch in range(epochs):
         scheduler.step()
         total_loss += loss.item()
 
-    print(f"Epoch {epoch+1}/{epochs}, Loss: {total_loss/len(train_loader):.4f}")
+        # Print progress every 50 batches
+        if (i + 1) % 50 == 0 or (i + 1) == len(train_loader):
+            print(f"Batch {i+1}/{len(train_loader)} - Avg Loss: {total_loss/(i+1):.4f}")
+
+    print(f"Epoch {epoch+1} finished - Avg Loss: {total_loss/len(train_loader):.4f}")
 
 # -------------------------
-# Evaluation
+# Evaluation with prints
 # -------------------------
+print("\n===== Evaluating on test set =====")
 model.eval()
 all_preds_lvl1, all_labels_lvl1 = [], []
 all_preds_lvl2, all_labels_lvl2 = [], []
 
 with torch.no_grad():
-    for batch in test_loader:
+    for i, batch in enumerate(test_loader):
         input_ids = batch['input_ids'].to(device)
         attention_mask = batch['attention_mask'].to(device)
         labels_lvl1 = batch['labels_lvl1'].to(device)
@@ -160,12 +166,15 @@ with torch.no_grad():
         all_preds_lvl2.extend(preds_lvl2.cpu().numpy())
         all_labels_lvl2.extend(labels_lvl2.cpu().numpy())
 
+        if (i + 1) % 20 == 0 or (i + 1) == len(test_loader):
+            print(f"Processed {i+1}/{len(test_loader)} batches")
+
 f1_lvl1 = f1_score(all_labels_lvl1, all_preds_lvl1, average='weighted')
 f1_lvl2 = f1_score(all_labels_lvl2, all_preds_lvl2, average='weighted')
-print(f"Weighted F1 - Level 1: {f1_lvl1:.4f}, Level 2: {f1_lvl2:.4f}")
+print(f"\nWeighted F1 - Level 1: {f1_lvl1:.4f}, Level 2: {f1_lvl2:.4f}")
 
 # -------------------------
-# Save unified model
+# Save model with print
 # -------------------------
 torch.save({
     'model_state_dict': model.state_dict(),

@@ -2,7 +2,7 @@ import torch
 from torch.utils.data import Dataset, DataLoader
 from transformers import DistilBertTokenizer, DistilBertForSequenceClassification
 from torch.optim import AdamW
-from torch.optim.swa_utils import AveragedModel, SWALR
+from torch.optim.swa_utils import AveragedModel, SWALR, update_bn
 from sklearn.preprocessing import LabelEncoder
 from sklearn.model_selection import train_test_split
 from sklearn.metrics import accuracy_score, f1_score
@@ -77,7 +77,7 @@ model_lvl1 = DistilBertForSequenceClassification.from_pretrained(
 ).to(device)
 optimizer_lvl1 = AdamW(model_lvl1.parameters(), lr=2e-5)
 epochs_lvl1 = 8
-scaler = torch.cuda.amp.GradScaler()
+scaler = torch.amp.GradScaler()
 use_swa = True
 
 if use_swa:
@@ -129,12 +129,11 @@ for epoch in range(epochs_lvl1):
     print(f"Level 1 Validation -> Accuracy: {acc_lvl1:.4f}, Weighted F1: {f1_lvl1:.4f}")
 
 # -------------------------
-# Apply SWA weights
+# Apply SWA batch norm (without loading into HF model)
 # -------------------------
 if use_swa:
-    torch.optim.swa_utils.update_bn(train_loader_lvl1, swa_model)
-    # copy SWA weights back to the HF model for saving
-    model_lvl1.load_state_dict(swa_model.state_dict())
+    update_bn(train_loader_lvl1, swa_model)
+    print("SWA batch norm updated. Skipping direct loading into Hugging Face model.")
 
 # -------------------------
 # Save Level 1 model

@@ -5,7 +5,7 @@ from torch.optim import AdamW
 from torch.optim.swa_utils import AveragedModel, SWALR
 from sklearn.preprocessing import LabelEncoder
 from sklearn.model_selection import train_test_split
-from sklearn.metrics import accuracy_score, f1_score, classification_report
+from sklearn.metrics import accuracy_score, f1_score
 import pandas as pd
 import os, gc
 from tqdm import tqdm
@@ -103,13 +103,16 @@ for epoch in range(epochs_lvl1):
         scaler.step(optimizer_lvl1)
         scaler.update()
         total_loss += loss.item()
+    
     print(f"Level 1 Epoch {epoch+1} Avg Loss: {total_loss/len(train_loader_lvl1):.4f}")
 
     if use_swa and epoch >= swa_start:
         swa_model.update_parameters(model_lvl1)
         swa_scheduler.step()
 
+    # -------------------------
     # Validation
+    # -------------------------
     model_lvl1.eval()
     all_preds_lvl1, all_labels_lvl1 = [], []
     with torch.no_grad():
@@ -125,12 +128,17 @@ for epoch in range(epochs_lvl1):
     f1_lvl1 = f1_score(all_labels_lvl1, all_preds_lvl1, average='weighted')
     print(f"Level 1 Validation -> Accuracy: {acc_lvl1:.4f}, Weighted F1: {f1_lvl1:.4f}")
 
+# -------------------------
 # Apply SWA weights
+# -------------------------
 if use_swa:
     torch.optim.swa_utils.update_bn(train_loader_lvl1, swa_model)
-    model_lvl1 = swa_model
+    # copy SWA weights back to the HF model for saving
+    model_lvl1.load_state_dict(swa_model.state_dict())
 
+# -------------------------
 # Save Level 1 model
+# -------------------------
 os.makedirs("models/level1", exist_ok=True)
 model_lvl1.save_pretrained("models/level1")
 tokenizer.save_pretrained("models/level1")
@@ -156,6 +164,7 @@ for idx, lvl1_label in enumerate(le_lvl1.classes_):
     optimizer_lvl2 = AdamW(model_lvl2.parameters(), lr=2e-5)
     epochs_lvl2 = 8
 
+    # Level 2 training
     for epoch in range(epochs_lvl2):
         model_lvl2.train()
         total_loss = 0
@@ -178,7 +187,9 @@ for idx, lvl1_label in enumerate(le_lvl1.classes_):
     model_lvl2.save_pretrained(save_path)
     tokenizer.save_pretrained(save_path)
 
-    # Validation
+    # -------------------------
+    # Level 2 validation
+    # -------------------------
     test_indices = [i for i, y in enumerate(y_test1) if y == idx]
     X_sub_test = [X_test.iloc[i] for i in test_indices]
     y_sub_test = [y_test2.iloc[i] for i in test_indices]
@@ -228,7 +239,6 @@ def predict(text, tokenizer, model_lvl1, le_lvl1, le_lvl2):
         pred_lvl1_idx = torch.argmax(outputs_lvl1.logits, dim=1).item()
     lvl1_label = le_lvl1.inverse_transform([pred_lvl1_idx])[0]
 
-    # Load corresponding Level 2 model
     lvl2_path = f"models/level2_{pred_lvl1_idx}_{lvl1_label.replace(' ', '_')}"
     model_lvl2 = DistilBertForSequenceClassification.from_pretrained(lvl2_path).to(device)
     model_lvl2.eval()

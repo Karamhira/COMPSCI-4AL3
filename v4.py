@@ -76,7 +76,7 @@ model_lvl1 = DistilBertForSequenceClassification.from_pretrained(
     'distilbert-base-uncased', num_labels=len(le_lvl1.classes_)
 ).to(device)
 optimizer_lvl1 = AdamW(model_lvl1.parameters(), lr=2e-5)
-epochs_lvl1 = 8
+epochs_lvl1 = 15
 scaler = torch.amp.GradScaler()
 use_swa = True
 
@@ -161,7 +161,7 @@ for idx, lvl1_label in enumerate(le_lvl1.classes_):
         'distilbert-base-uncased', num_labels=len(unique_labels)
     ).to(device)
     optimizer_lvl2 = AdamW(model_lvl2.parameters(), lr=2e-5)
-    epochs_lvl2 = 8
+    epochs_lvl2 = 15
 
     # Level 2 training
     for epoch in range(epochs_lvl2):

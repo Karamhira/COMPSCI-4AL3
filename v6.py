@@ -1,23 +1,23 @@
 #!/usr/bin/env python3
 """
-Grandmaster (Local ModernBERT replacement) — Pure PyTorch, NO HuggingFace.
+Grandmaster ModernBERT (Local) — Pure PyTorch, no HuggingFace.
 
-Key features:
-- Local whitespace tokenizer + vocab (no HF)
-- Trainable Embedding + BiLSTM encoder
-- Two-head classifier for hierarchical labels
-- Weighted sampling, optional focal loss
-- Mixed precision + grad accumulation
-- Multi-seed training + simple ensemble
-- Save/Load tokenizer (vocab) + models
+- Local tokenizer + vocab
+- Learned positional embeddings
+- TransformerEncoder (PyTorch)
+- Two-head hierarchical classifier
+- Mixed precision training (torch.amp)
+- Safe max-pooling (computed in float32)
+- Weighted sampling / focal loss optional
+- Save/load local models & vocab
 """
 
 import os
-import random
-import math
 import json
-from typing import List, Dict, Tuple
+import math
+import random
 from collections import Counter
+from typing import List, Dict, Tuple
 
 import numpy as np
 import pandas as pd
@@ -26,8 +26,8 @@ from tqdm import tqdm
 import torch
 import torch.nn as nn
 from torch import amp
-from torch.utils.data import Dataset, DataLoader, WeightedRandomSampler
 from torch.amp import autocast, GradScaler
+from torch.utils.data import Dataset, DataLoader, WeightedRandomSampler
 
 from sklearn.preprocessing import LabelEncoder
 from sklearn.model_selection import train_test_split
@@ -41,98 +41,94 @@ CONFIG = {
     "text_columns": ["title", "content"],
     "lvl1_col": "category_level_1",
     "lvl2_col": "category_level_2",
-    "output_dir": "./grandmaster_local_models",
+    "output_dir": "./modernbert_local_models",
     "device": "cuda" if torch.cuda.is_available() else "cpu",
-    "seed": 42,
-    "seeds": [42, 43, 44],
-    "max_len": 200,
-    "vocab_size": 60000,          # top-k words kept
-    "min_freq": 2,                # min freq for token to be included
-    "embedding_dim": 300,
-    "encoder_hidden": 256,
-    "encoder_layers": 1,
-    "dropout": 0.2,
+
+    # tokenizer / vocab
+    "vocab_size": 50000,
+    "min_freq": 2,
+    "max_len": 256,
+
+    # model
+    "emb_dim": 256,
+    "n_layers": 4,
+    "n_heads": 8,
+    "ff_dim": 512,
+    "dropout": 0.1,
+
+    # training
     "batch_size": 16,
     "accumulation_steps": 2,
     "num_epochs": 6,
     "lr": 2e-4,
     "weight_decay": 1e-6,
-    "warmup_proportion": 0.05,
-    "freeze_epochs": 1,
+    "warmup_steps_ratio": 0.05,
     "use_focal_loss": False,
     "focal_gamma": 2.0,
+    "seeds": [42, 43, 44],
     "num_workers": 4,
-    # Optional: path to pretrained embedding .npy and vocab mapping .json (local)
-    "pretrained_embedding_path": None,
-    "pretrained_embedding_vocab": None,
-    # Tokenizer/saving
-    "vocab_path": "./grandmaster_local_models/vocab.json",
-    "save_dir": "./grandmaster_local_models",
+
+    # saving
+    "save_dir": "./modernbert_local_models",
+    "vocab_path": "./modernbert_local_models/vocab.json"
 }
 
 os.makedirs(CONFIG["output_dir"], exist_ok=True)
 os.makedirs(CONFIG["save_dir"], exist_ok=True)
 
 # -----------------------
-# Utilities
+# Utilities: tokenizer & vocab
 # -----------------------
-def set_seed(seed: int):
-    random.seed(seed)
-    np.random.seed(seed)
-    torch.manual_seed(seed)
-    if torch.cuda.is_available():
-        torch.cuda.manual_seed_all(seed)
-
 def simple_tokenize(text: str) -> List[str]:
-    # basic whitespace + punctuation separation (lightweight)
+    # lightweight whitespace + punctuation split
     text = str(text).lower()
-    chars = []
+    tokens = []
     token = []
     for ch in text:
         if ch.isalnum():
             token.append(ch)
         else:
             if token:
-                chars.append(''.join(token))
+                tokens.append(''.join(token))
                 token = []
             if ch.strip():
-                chars.append(ch)
+                tokens.append(ch)
     if token:
-        chars.append(''.join(token))
-    tokens = [t for t in chars if t.strip()]
-    return tokens
+        tokens.append(''.join(token))
+    return [t for t in tokens if t.strip()]
 
-# -----------------------
-# Build vocab from dataset
-# -----------------------
-def build_vocab(texts: List[str], cfg: Dict):
+def build_vocab(texts: List[str], cfg: Dict) -> Dict[str,int]:
     counter = Counter()
     for t in texts:
-        tokens = simple_tokenize(t)
-        counter.update(tokens)
-    tokens_and_freq = [(tok, freq) for tok, freq in counter.items() if freq >= cfg["min_freq"]]
-    tokens_and_freq.sort(key=lambda x: x[1], reverse=True)
-    topk = tokens_and_freq[:cfg["vocab_size"]]
-    vocab = {"<PAD>": 0, "<UNK>": 1}
-    idx = 2
+        counter.update(simple_tokenize(t))
+    items = [(tok, cnt) for tok, cnt in counter.items() if cnt >= cfg["min_freq"]]
+    items.sort(key=lambda x: x[1], reverse=True)
+    topk = items[:cfg["vocab_size"]]
+    vocab = {"<PAD>": 0, "<UNK>": 1, "<CLS>": 2, "<SEP>": 3}
+    idx = len(vocab)
     for tok, _ in topk:
-        vocab[tok] = idx
-        idx += 1
+        if tok in vocab: continue
+        vocab[tok] = idx; idx += 1
     return vocab
 
-def text_to_ids(text: str, vocab: Dict[str,int], max_len: int):
-    tokens = simple_tokenize(text)
-    ids = [vocab.get(t, vocab["<UNK>"]) for t in tokens][:max_len]
-    return ids
+def text_to_ids(text: str, vocab: Dict[str,int], max_len: int) -> List[int]:
+    toks = simple_tokenize(text)
+    ids = [vocab.get(t, vocab["<UNK>"]) for t in toks][:max_len-2]
+    # add cls/sep
+    ids = [vocab["<CLS>"]] + ids + [vocab["<SEP>"]]
+    if len(ids) < max_len:
+        # padding handled later in collate
+        return ids
+    return ids[:max_len]
 
 # -----------------------
-# Dataset
+# Dataset + collate
 # -----------------------
 class NewsLocalDataset(Dataset):
-    def __init__(self, texts: List[str], lvl1_ids: List[int], lvl2_ids: List[int], vocab: Dict[str,int], max_len: int):
+    def __init__(self, texts: List[str], lvl1: List[int], lvl2: List[int], vocab: Dict[str,int], max_len: int):
         self.texts = texts
-        self.lvl1 = lvl1_ids
-        self.lvl2 = lvl2_ids
+        self.lvl1 = lvl1
+        self.lvl2 = lvl2
         self.vocab = vocab
         self.max_len = max_len
 
@@ -140,22 +136,23 @@ class NewsLocalDataset(Dataset):
         return len(self.texts)
 
     def __getitem__(self, idx):
-        text = self.texts[idx]
-        input_ids = text_to_ids(text, self.vocab, self.max_len)
+        t = self.texts[idx]
+        ids = text_to_ids(t, self.vocab, self.max_len)
         return {
-            "input_ids": torch.tensor(input_ids, dtype=torch.long),
+            "input_ids": torch.tensor(ids, dtype=torch.long),
             "lvl1": torch.tensor(self.lvl1[idx], dtype=torch.long),
             "lvl2": torch.tensor(self.lvl2[idx], dtype=torch.long),
-            "length": len(input_ids)
+            "length": len(ids)
         }
 
-def collate_fn(batch, pad_id=0, max_len=None):
+def collate_batch(batch, pad_id=0, max_len=None):
     lengths = [b["length"] for b in batch]
     max_l = max(lengths) if max_len is None else min(max(lengths), max_len)
     padded = []
     for b in batch:
         ids = b["input_ids"][:max_l].tolist()
-        ids = ids + [pad_id] * (max_l - len(ids))
+        if len(ids) < max_l:
+            ids = ids + [pad_id] * (max_l - len(ids))
         padded.append(ids)
     input_ids = torch.tensor(padded, dtype=torch.long)
     attention_mask = (input_ids != pad_id).long()
@@ -164,25 +161,24 @@ def collate_fn(batch, pad_id=0, max_len=None):
     return {"input_ids": input_ids, "attention_mask": attention_mask, "lvl1": lvl1, "lvl2": lvl2}
 
 # -----------------------
-# Model (Embedding + BiLSTM + pooling + heads)
+# Model: local "ModernBERT" style (learned pos emb + TransformerEncoder)
 # -----------------------
-class HierLocalModel(nn.Module):
-    def __init__(self, vocab_size:int, emb_dim:int, enc_hidden:int, num_lvl1:int, num_lvl2:int, emb_weights:torch.Tensor=None, dropout=0.2, num_layers=1):
+class ModernBERTLocal(nn.Module):
+    def __init__(self, vocab_size:int, emb_dim:int, n_layers:int, n_heads:int, ff_dim:int, dropout:float, max_len:int, num_lvl1:int, num_lvl2:int):
         super().__init__()
-        self.embedding = nn.Embedding(vocab_size, emb_dim, padding_idx=0)
-        if emb_weights is not None:
-            try:
-                self.embedding.weight.data.copy_(emb_weights)
-            except Exception:
-                pass
-        self.encoder = nn.LSTM(input_size=emb_dim, hidden_size=enc_hidden, num_layers=num_layers, batch_first=True, bidirectional=True, dropout=dropout if num_layers>1 else 0.0)
+        self.token_emb = nn.Embedding(vocab_size, emb_dim, padding_idx=0)
+        self.pos_emb = nn.Embedding(max_len, emb_dim)
+        self.layernorm = nn.LayerNorm(emb_dim)
+        encoder_layer = nn.TransformerEncoderLayer(d_model=emb_dim, nhead=n_heads, dim_feedforward=ff_dim, dropout=dropout, activation="gelu", batch_first=True)
+        self.encoder = nn.TransformerEncoder(encoder_layer, num_layers=n_layers)
         self.dropout = nn.Dropout(dropout)
-        hidden_size = enc_hidden * 2  # bidirectional
-        # pooling projection (input = hidden_size)
-        self.proj = nn.Linear(hidden_size, hidden_size)
-        # heads
-        self.head1 = nn.Linear(hidden_size, num_lvl1)
-        self.head2 = nn.Linear(hidden_size, num_lvl2)
+
+        hidden = emb_dim
+        # pooling projection if needed
+        self.proj = nn.Linear(hidden, hidden)
+        self.head1 = nn.Linear(hidden, num_lvl1)
+        self.head2 = nn.Linear(hidden, num_lvl2)
+
         # init
         nn.init.xavier_uniform_(self.head1.weight)
         nn.init.xavier_uniform_(self.head2.weight)
@@ -193,33 +189,41 @@ class HierLocalModel(nn.Module):
 
     def forward(self, input_ids, attention_mask=None):
         # input_ids: (B, L)
-        emb = self.embedding(input_ids)               # (B, L, E)
-        outputs, _ = self.encoder(emb)               # (B, L, 2H)
+        B, L = input_ids.shape
+        positions = torch.arange(0, L, device=input_ids.device).unsqueeze(0).expand(B, L)
+        x = self.token_emb(input_ids) + self.pos_emb(positions)
+        x = self.layernorm(x)
 
-        # attention_mask optional; do mean + max pooling (max computed safely)
-        mask = (input_ids != 0).unsqueeze(-1).float()  # (B,L,1)
+        # prepare transformer mask: True for positions to attend (0 = pad)
+        if attention_mask is None:
+            attn_mask = (input_ids != 0).long()
+        else:
+            attn_mask = attention_mask
 
-        # mean pool (works fine in float16 or float32)
-        summed = (outputs * mask).sum(1)              # (B, 2H)
+        # Transformer wants src_key_padding_mask with True where padding -> mask out
+        src_key_padding_mask = (attn_mask == 0)  # (B, L) bool
+
+        # encoder output (B, L, emb)
+        enc_out = self.encoder(x, src_key_padding_mask=src_key_padding_mask)
+
+        # pooling: mean pool + safe max pool (Fix A)
+        mask = attn_mask.unsqueeze(-1).float()  # (B, L, 1)
+        summed = (enc_out * mask).sum(1)        # (B, emb)
         denom = mask.sum(1).clamp(min=1e-9)
-        mean_pool = summed / denom                    # (B,2H)
+        mean_pool = summed / denom              # (B, emb)
 
-        # compute max-pool safely in float32 to avoid float16 overflow in masked_fill
-        outputs_fp32 = outputs.float()
+        # safe max in float32
+        enc_fp32 = enc_out.float()
         mask_fp32 = mask.float()
-        masked = outputs_fp32.masked_fill(mask_fp32 == 0, -1e9)
-        max_pool, _ = masked.max(1)                   # (B,2H)
-        # convert back to outputs dtype (handles float16 case)
-        max_pool = max_pool.to(outputs.dtype)
+        masked = enc_fp32.masked_fill(mask_fp32 == 0, -1e9)
+        max_pool, _ = masked.max(1)             # (B, emb)
+        max_pool = max_pool.to(enc_out.dtype)
 
-        # choose pooling strategy: using mean_pool by default (safer, smaller proj)
+        # choose pooling strategy (mean by default)
         pooled = mean_pool
-        # if you want to use concatenated mean+max, replace above with:
-        # pooled = torch.cat([mean_pool, max_pool], dim=1)
-        # and update self.proj input dim accordingly.
+        # pooled = torch.cat([mean_pool, max_pool], dim=1)  # if you want concat, update proj/head dims
 
-        # project
-        feat = torch.tanh(self.proj(self.dropout(pooled)))  # (B, 2H)
+        feat = torch.tanh(self.proj(self.dropout(pooled)))
         logits1 = self.head1(feat)
         logits2 = self.head2(feat)
         return logits1, logits2
@@ -231,21 +235,20 @@ class FocalLoss(nn.Module):
     def __init__(self, gamma=2.0, weight=None, reduction="mean"):
         super().__init__()
         self.gamma = gamma
-        self.weight = weight
         self.reduction = reduction
         self.ce = nn.CrossEntropyLoss(weight=weight, reduction="none")
     def forward(self, logits, targets):
-        ce_loss = self.ce(logits, targets)  # (B,)
-        pt = torch.exp(-ce_loss)
-        loss = ((1 - pt) ** self.gamma) * ce_loss
+        ce = self.ce(logits, targets)
+        pt = torch.exp(-ce)
+        loss = ((1 - pt) ** self.gamma) * ce
         if self.reduction == "mean":
             return loss.mean()
-        elif self.reduction == "sum":
+        if self.reduction == "sum":
             return loss.sum()
         return loss
 
 # -----------------------
-# Sampler & weights
+# Sampler builder
 # -----------------------
 def build_sampler(df_train: pd.DataFrame, label_col: str, device: str):
     counts = df_train[label_col].value_counts()
@@ -260,17 +263,18 @@ def build_sampler(df_train: pd.DataFrame, label_col: str, device: str):
     return sampler, class_weight_tensor
 
 # -----------------------
-# Evaluate
+# Eval
 # -----------------------
-def evaluate(model: HierLocalModel, dataloader: DataLoader, device: str):
+def evaluate(model: ModernBERTLocal, dataloader: DataLoader, device: str):
     model.eval()
     preds1, preds2, trues1, trues2 = [], [], [], []
     with torch.no_grad():
         for batch in dataloader:
             ids = batch["input_ids"].to(device)
+            mask = batch["attention_mask"].to(device)
             l1 = batch["lvl1"].to(device)
             l2 = batch["lvl2"].to(device)
-            logits1, logits2 = model(ids)
+            logits1, logits2 = model(ids, mask)
             p1 = torch.argmax(logits1, dim=1)
             p2 = torch.argmax(logits2, dim=1)
             preds1.extend(p1.cpu().tolist())
@@ -287,79 +291,65 @@ def evaluate(model: HierLocalModel, dataloader: DataLoader, device: str):
 # -----------------------
 # Train one seed
 # -----------------------
-def train_one_seed(seed: int, cfg: Dict, df: pd.DataFrame, le1: LabelEncoder, le2: LabelEncoder, vocab: Dict[str,int], emb_weights: torch.Tensor=None):
-    set_seed(seed)
+def train_one_seed(seed: int, cfg: Dict, df: pd.DataFrame, le1: LabelEncoder, le2: LabelEncoder, vocab: Dict[str,int]):
+    # reproducibility
+    random.seed(seed); np.random.seed(seed); torch.manual_seed(seed)
+    if torch.cuda.is_available(): torch.cuda.manual_seed_all(seed)
     device = cfg["device"]
 
-    # split
     train_df, val_df = train_test_split(df, test_size=0.15, stratify=df["lvl2_id"], random_state=seed)
 
-    # datasets
     train_ds = NewsLocalDataset(train_df["text"].tolist(), train_df["lvl1_id"].tolist(), train_df["lvl2_id"].tolist(), vocab, cfg["max_len"])
     val_ds = NewsLocalDataset(val_df["text"].tolist(), val_df["lvl1_id"].tolist(), val_df["lvl2_id"].tolist(), vocab, cfg["max_len"])
 
     sampler, class_weight_tensor = build_sampler(train_df, "lvl2_id", device)
-    train_loader = DataLoader(train_ds, batch_size=cfg["batch_size"], sampler=sampler, collate_fn=lambda b: collate_fn(b, pad_id=0, max_len=cfg["max_len"]), num_workers=cfg["num_workers"])
-    val_loader = DataLoader(val_ds, batch_size=cfg["batch_size"], shuffle=False, collate_fn=lambda b: collate_fn(b, pad_id=0, max_len=cfg["max_len"]), num_workers=cfg["num_workers"])
+    train_loader = DataLoader(train_ds, batch_size=cfg["batch_size"], sampler=sampler,
+                              collate_fn=lambda b: collate_batch(b, pad_id=vocab["<PAD>"], max_len=cfg["max_len"]),
+                              num_workers=cfg["num_workers"])
+    val_loader = DataLoader(val_ds, batch_size=cfg["batch_size"], shuffle=False,
+                             collate_fn=lambda b: collate_batch(b, pad_id=vocab["<PAD>"], max_len=cfg["max_len"]),
+                             num_workers=cfg["num_workers"])
 
-    num_lvl1 = len(le1.classes_)
-    num_lvl2 = len(le2.classes_)
-    model = HierLocalModel(len(vocab), cfg["embedding_dim"], cfg["encoder_hidden"], num_lvl1, num_lvl2, emb_weights, dropout=cfg["dropout"], num_layers=cfg["encoder_layers"]).to(device)
+    num_lvl1 = len(le1.classes_); num_lvl2 = len(le2.classes_)
+    model = ModernBERTLocal(len(vocab), cfg["emb_dim"], cfg["n_layers"], cfg["n_heads"], cfg["ff_dim"], cfg["dropout"], cfg["max_len"], num_lvl1, num_lvl2).to(device)
 
-    # optionally freeze embeddings for first epoch(s)
-    if cfg["freeze_epochs"] > 0:
-        for name, p in model.named_parameters():
-            if "embedding" in name:
-                p.requires_grad = False
-
-    optimizer = torch.optim.AdamW(filter(lambda p: p.requires_grad, model.parameters()), lr=cfg["lr"], weight_decay=cfg["weight_decay"])
+    optimizer = torch.optim.AdamW(model.parameters(), lr=cfg["lr"], weight_decay=cfg["weight_decay"])
     total_steps = math.ceil(len(train_loader) * cfg["num_epochs"] / cfg["accumulation_steps"])
-    warmup_steps = int(cfg["warmup_proportion"] * total_steps)
-    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=max(1, total_steps - warmup_steps))
+    warmup_steps = max(1, int(cfg["warmup_steps_ratio"] * total_steps))
+    scheduler = torch.optim.lr_scheduler.OneCycleLR(optimizer, max_lr=cfg["lr"], total_steps=max(1,total_steps), pct_start=warmup_steps/max(1,total_steps), anneal_strategy="cos", final_div_factor=100.0)
 
-    # loss
+    # losses
     if cfg["use_focal_loss"]:
         loss_lvl2 = FocalLoss(cfg["focal_gamma"], weight=class_weight_tensor.to(device))
     else:
         loss_lvl2 = nn.CrossEntropyLoss(weight=class_weight_tensor.to(device))
-    # level1 class weights
+    # lvl1 weights (balance by freq)
     lvl1_counts = train_df["lvl1_id"].value_counts()
-    lvl1_weights = torch.tensor([1.0 / lvl1_counts.get(i, 1.0) for i in range(len(le1.classes_))], dtype=torch.float, device=device)
+    lvl1_weights = torch.tensor([1.0 / lvl1_counts.get(i, 1.0) for i in range(num_lvl1)], dtype=torch.float, device=device)
     loss_lvl1 = nn.CrossEntropyLoss(weight=lvl1_weights)
 
-    # GradScaler: prefer explicit device_type to silence FutureWarning
-# AMP Scaler (PyTorch ≥2.5)
-    if torch.cuda.is_available():
-        scaler = torch.amp.GradScaler("cuda")
-    else:
-        scaler = torch.amp.GradScaler()
+    # GradScaler (safe default)
+    scaler = GradScaler()
 
-    best_val_f1 = -1.0
+    best_val = -1.0
     model_dir = os.path.join(cfg["save_dir"], f"seed_{seed}")
     os.makedirs(model_dir, exist_ok=True)
 
-    # choose autocast device type
     autocast_device = "cuda" if device.startswith("cuda") else "cpu"
 
     for epoch in range(cfg["num_epochs"]):
         model.train()
-        if epoch == cfg["freeze_epochs"]:
-            # unfreeze embeddings
-            for name, p in model.named_parameters():
-                p.requires_grad = True
-            optimizer = torch.optim.AdamW(filter(lambda p: p.requires_grad, model.parameters()), lr=cfg["lr"], weight_decay=cfg["weight_decay"])
-            scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=max(1, total_steps - warmup_steps))
-
         running_loss = 0.0
         optimizer.zero_grad()
         pbar = tqdm(enumerate(train_loader), total=len(train_loader), desc=f"Seed {seed} Epoch {epoch+1}")
         for step, batch in pbar:
             ids = batch["input_ids"].to(device)
+            mask = batch["attention_mask"].to(device)
             y1 = batch["lvl1"].to(device)
             y2 = batch["lvl2"].to(device)
 
-            with amp.autocast(device_type=autocast_device):
-                logits1, logits2 = model(ids)
+            with autocast(device_type=autocast_device):
+                logits1, logits2 = model(ids, mask)
                 l1 = loss_lvl1(logits1, y1)
                 l2 = loss_lvl2(logits2, y2)
                 loss = 0.5 * l1 + 1.0 * l2
@@ -383,9 +373,8 @@ def train_one_seed(seed: int, cfg: Dict, df: pd.DataFrame, le1: LabelEncoder, le
         val_metrics = evaluate(model, val_loader, device)
         print(f"[Seed {seed}] Epoch {epoch+1} Validation: lvl1_acc={val_metrics['lvl1_acc']:.4f} lvl2_acc={val_metrics['lvl2_acc']:.4f} lvl2_macro_f1={val_metrics['lvl2_macro_f1']:.4f}")
 
-        # save best
-        if val_metrics["lvl2_macro_f1"] > best_val_f1:
-            best_val_f1 = val_metrics["lvl2_macro_f1"]
+        if val_metrics["lvl2_macro_f1"] > best_val:
+            best_val = val_metrics["lvl2_macro_f1"]
             torch.save({
                 "model_state_dict": model.state_dict(),
                 "optimizer_state_dict": optimizer.state_dict(),
@@ -395,20 +384,20 @@ def train_one_seed(seed: int, cfg: Dict, df: pd.DataFrame, le1: LabelEncoder, le
             with open(os.path.join(model_dir, "meta.json"), "w") as f:
                 json.dump({"seed": seed, "num_lvl1": num_lvl1, "num_lvl2": num_lvl2}, f)
 
-    # save vocab
+    # save vocab for this seed (stable across seeds)
     with open(os.path.join(model_dir, "vocab.json"), "w") as f:
         json.dump(vocab, f)
+
     return model_dir
 
 # -----------------------
-# Ensemble inference
+# Load & ensemble
 # -----------------------
 def load_local_model(model_dir: str, cfg: Dict):
-    # load vocab and model
     with open(os.path.join(model_dir, "vocab.json"), "r") as f:
         vocab = json.load(f)
     meta = json.load(open(os.path.join(model_dir, "meta.json")))
-    model = HierLocalModel(len(vocab), cfg["embedding_dim"], cfg["encoder_hidden"], meta["num_lvl1"], meta["num_lvl2"], emb_weights=None, dropout=cfg["dropout"], num_layers=cfg["encoder_layers"])
+    model = ModernBERTLocal(len(vocab), cfg["emb_dim"], cfg["n_layers"], cfg["n_heads"], cfg["ff_dim"], cfg["dropout"], cfg["max_len"], meta["num_lvl1"], meta["num_lvl2"])
     ckpt = torch.load(os.path.join(model_dir, "best_model.pt"), map_location=cfg["device"])
     model.load_state_dict(ckpt["model_state_dict"])
     model.to(cfg["device"])
@@ -421,21 +410,18 @@ def ensemble_predict(texts: List[str], model_dirs: List[str], cfg: Dict, le1: La
     vocabs = []
     for d in model_dirs:
         m, v = load_local_model(d, cfg)
-        models.append(m)
-        vocabs.append(v)
-
+        models.append(m); vocabs.append(v)
     vocab = vocabs[0]
     all_ids = [text_to_ids(t, vocab, cfg["max_len"]) for t in texts]
-    pad_id = vocab.get("<PAD>", 0)
+    pad = vocab.get("<PAD>", 0)
     maxlen = max(len(x) for x in all_ids)
-    padded = [x + [pad_id]*(maxlen - len(x)) for x in all_ids]
+    padded = [x + [pad]*(maxlen - len(x)) for x in all_ids]
     input_ids = torch.tensor(padded, dtype=torch.long).to(device)
 
-    logits1_list = []
-    logits2_list = []
+    logits1_list, logits2_list = [], []
     with torch.no_grad():
-        for model in models:
-            l1, l2 = model(input_ids)
+        for m in models:
+            l1, l2 = m(input_ids, (input_ids!=pad).long().to(device))
             logits1_list.append(l1.cpu().numpy())
             logits2_list.append(l2.cpu().numpy())
 
@@ -446,10 +432,9 @@ def ensemble_predict(texts: List[str], model_dirs: List[str], cfg: Dict, le1: La
     return le1.inverse_transform(preds1), le2.inverse_transform(preds2)
 
 # -----------------------
-# Run full pipeline
+# Run pipeline
 # -----------------------
 def run_full_pipeline(cfg: Dict):
-    # load data
     df = pd.read_csv(cfg["data_csv"])
     df["text"] = df[cfg["text_columns"]].fillna("").agg(" ".join, axis=1)
     df = df.dropna(subset=["text", cfg["lvl1_col"], cfg["lvl2_col"]]).reset_index(drop=True)
@@ -461,29 +446,23 @@ def run_full_pipeline(cfg: Dict):
     print("[INFO] Loaded dataset:", len(df), "rows")
     print("[INFO] Level-1 classes:", len(le1.classes_), "Level-2 classes:", len(le2.classes_))
 
-    # build vocabulary from full dataset (stable across seeds)
-    print("[INFO] Building vocabulary...")
+    print("[INFO] Building vocab...")
     vocab = build_vocab(df["text"].tolist(), cfg)
     with open(cfg["vocab_path"], "w") as f:
         json.dump(vocab, f)
     print("[INFO] Vocab size:", len(vocab))
 
-    emb_weights = None
-    if cfg.get("pretrained_embedding_path") and cfg.get("pretrained_embedding_vocab"):
-        emb_weights = np.load(cfg["pretrained_embedding_path"])
-        emb_weights = torch.tensor(emb_weights, dtype=torch.float)
-
     model_dirs = []
     for seed in cfg["seeds"]:
-        print(f"\n========== TRAINING SEED {seed} ==========")
-        md = train_one_seed(seed, cfg, df, le1, le2, vocab, emb_weights)
+        print(f"\n===== TRAINING SEED {seed} =====")
+        md = train_one_seed(seed, cfg, df, le1, le2, vocab)
         model_dirs.append(md)
 
-    # quick ensemble check
+    # quick ensemble sanity check
     _, val_df = train_test_split(df, test_size=0.15, stratify=df["lvl2_id"], random_state=cfg["seeds"][0])
     sample_texts = val_df["text"].tolist()[:256]
     lvl1_preds, lvl2_preds = ensemble_predict(sample_texts, model_dirs, cfg, le1, le2)
-    print("[INFO] Ensemble example (first 10):")
+    print("[INFO] Ensemble sample outputs:")
     for i in range(min(10, len(lvl2_preds))):
         print(f" L1: {lvl1_preds[i]}  L2: {lvl2_preds[i]}")
 

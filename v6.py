@@ -27,7 +27,7 @@ import torch
 import torch.nn as nn
 from torch import amp
 from torch.utils.data import Dataset, DataLoader, WeightedRandomSampler
-from torch.cuda.amp import GradScaler
+from torch.amp import autocast, GradScaler
 
 from sklearn.preprocessing import LabelEncoder
 from sklearn.model_selection import train_test_split
@@ -328,7 +328,11 @@ def train_one_seed(seed: int, cfg: Dict, df: pd.DataFrame, le1: LabelEncoder, le
     loss_lvl1 = nn.CrossEntropyLoss(weight=lvl1_weights)
 
     # GradScaler: prefer explicit device_type to silence FutureWarning
-    scaler = GradScaler(device_type="cuda") if torch.cuda.is_available() else GradScaler()
+# AMP Scaler (PyTorch ≥2.5)
+    if torch.cuda.is_available():
+        scaler = torch.amp.GradScaler("cuda")
+    else:
+        scaler = torch.amp.GradScaler()
 
     best_val_f1 = -1.0
     model_dir = os.path.join(cfg["save_dir"], f"seed_{seed}")

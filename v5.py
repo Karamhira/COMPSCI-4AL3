@@ -1,4 +1,3 @@
-
 import os
 import random
 import math
@@ -9,8 +8,9 @@ from tqdm import tqdm
 
 import torch
 import torch.nn as nn
+from torch import amp
 from torch.utils.data import Dataset, DataLoader, WeightedRandomSampler
-from torch.cuda.amp import autocast, GradScaler
+from torch.cuda.amp import GradScaler
 
 from transformers import (
     AutoTokenizer,
@@ -23,39 +23,46 @@ from transformers import (
 from torch.optim import AdamW
 from sklearn.preprocessing import LabelEncoder
 from sklearn.model_selection import train_test_split
-from sklearn.metrics import accuracy_score, f1_score, confusion_matrix
+from sklearn.metrics import accuracy_score, f1_score
 
 # -----------------------
 # CONFIG
 # -----------------------
 CONFIG = {
     "data_csv": "./dataset/MN-DS-news-classification.csv",
-    # Columns in CSV:
-    "text_columns": ["title", "content"],   # will be concatenated
+    "text_columns": ["title", "content"],
     "lvl1_col": "category_level_1",
     "lvl2_col": "category_level_2",
     "model_name": "microsoft/deberta-v3-base",
-    "t5_aug_model": "t5-small",   # for paraphrasing (smaller for speed)
+    # paraphraser model (flan/t5 variants may be faster/better)
+    "t5_aug_model": "ramsrigouthamg/t5_paraphraser",
     "max_len": 256,
     "batch_size": 8,
-    "accumulation_steps": 4,  # effective batch size = batch_size * accumulation_steps
+    "accumulation_steps": 4,
     "num_epochs": 4,
     "lr": 2e-5,
     "weight_decay": 0.01,
     "warmup_proportion": 0.1,
-    "freeze_layers": 8,  # number of bottom encoder layers to freeze for epoch 0
-    "augment_min_samples": 150,  # only augment classes with <= this samples
-    "augment_factor": 2,  # how many augmented copies per original for target small classes
+    "freeze_layers": 8,
+    "augment_min_samples": 150,     # classes with <= this will be considered 'rare'
+    "augment_factor": 2,            # times to augment each rare sample (effective multiplier)
     "use_t5_aug": True,
+    "paraphrase_batch_size": 32,    # batch size for paraphraser
+    "paraphrase_sampling": True,    # use sampling (fast) vs beam search (higher quality slower)
+    "paraphrase_top_k": 50,
+    "paraphrase_top_p": 0.95,
+    "paraphrase_temp": 0.8,
     "focal_loss_gamma": 2.0,
-    "use_focal_loss": False,  # optional, sometimes helps
-    "seeds": [42, 43, 44],  # ensemble seeds
+    "use_focal_loss": False,
+    "seeds": [42, 43, 44],
     "output_dir": "./grandmaster_models",
     "device": "cuda" if torch.cuda.is_available() else "cpu",
-    "num_workers": 4
+    "num_workers": 4,
+    "aug_cache_path": "./grandmaster_models/augmented_train.csv"  # cache location
 }
 
 os.makedirs(CONFIG["output_dir"], exist_ok=True)
+print("[CONFIG] Using device:", CONFIG["device"])
 
 # -----------------------
 # Utilities
@@ -64,49 +71,137 @@ def set_seed(seed: int):
     random.seed(seed)
     np.random.seed(seed)
     torch.manual_seed(seed)
-    torch.cuda.manual_seed_all(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
 
 # -----------------------
 # Data load + preprocess
 # -----------------------
 def load_and_prepare_df(cfg) -> Tuple[pd.DataFrame, LabelEncoder, LabelEncoder]:
     df = pd.read_csv(cfg["data_csv"])
-    # create text column
     df["text"] = df[cfg["text_columns"]].fillna("").agg(" ".join, axis=1)
-    # drop empties
     df = df.dropna(subset=["text", cfg["lvl1_col"], cfg["lvl2_col"]]).reset_index(drop=True)
 
-    # encode level labels
     le1 = LabelEncoder()
     le2 = LabelEncoder()
     df["lvl1_id"] = le1.fit_transform(df[cfg["lvl1_col"]])
     df["lvl2_id"] = le2.fit_transform(df[cfg["lvl2_col"]])
-
     return df, le1, le2
 
 # -----------------------
-# Optional T5-based paraphrase augmentor (slow but useful)
+# Fast GPU-batched paraphraser (with caching)
 # -----------------------
-class T5Paraphraser:
-    def __init__(self, model_name="t5-small", device="cpu"):
-        self.device = device
-        self.model = T5ForConditionalGeneration.from_pretrained(model_name).to(device)
-        self.tokenizer = T5Tokenizer.from_pretrained(model_name)
+def build_paraphraser(cfg):
+    """
+    Loads paraphraser model & tokenizer once.
+    Use T5Tokenizer(..., legacy=False) to suppress legacy warning.
+    """
+    device = cfg["device"]
+    print("[INFO] Loading paraphraser:", cfg["t5_aug_model"], "on", device)
+    tokenizer = T5Tokenizer.from_pretrained(cfg["t5_aug_model"], legacy=False)
+    model = T5ForConditionalGeneration.from_pretrained(cfg["t5_aug_model"])
+    model.to(device)
+    model.eval()
+    return model, tokenizer, device
 
-    def paraphrase(self, text: str, num_return_sequences: int = 1, max_length=256) -> List[str]:
-        # A simple prompt-style paraphrase
-        input_text = f"paraphrase: {text} </s>"
-        encoding = self.tokenizer(input_text, return_tensors="pt", truncation=True, max_length=256).to(self.device)
-        outputs = self.model.generate(
-            **encoding,
-            max_length=max_length,
-            num_beams=4,
-            num_return_sequences=num_return_sequences,
-            do_sample=False,
-            early_stopping=True
-        )
-        decs = [self.tokenizer.decode(o, skip_special_tokens=True, clean_up_tokenization_spaces=True) for o in outputs]
-        return decs
+def paraphrase_batch(model, tokenizer, device, sentences: List[str], cfg) -> List[str]:
+    """
+    Paraphrase a batch of sentences. Uses sampling (fast) by default.
+    Falls back to returning original sentences on any failure.
+    """
+    prompts = [f"paraphrase: {s}" for s in sentences]
+    enc = tokenizer(prompts, padding=True, truncation=True, return_tensors="pt", max_length=cfg["max_len"])
+    input_ids = enc["input_ids"].to(device)
+    attention_mask = enc["attention_mask"].to(device)
+
+    gen_kwargs = {
+        "input_ids": input_ids,
+        "attention_mask": attention_mask,
+        "max_length": cfg["max_len"],
+        "num_return_sequences": 1,
+        "early_stopping": True,
+    }
+
+    if cfg["paraphrase_sampling"]:
+        gen_kwargs.update({
+            "do_sample": True,
+            "top_k": cfg["paraphrase_top_k"],
+            "top_p": cfg["paraphrase_top_p"],
+            "temperature": cfg["paraphrase_temp"],
+            "num_beams": 1
+        })
+    else:
+        gen_kwargs.update({
+            "do_sample": False,
+            "num_beams": 4
+        })
+
+    try:
+        with torch.no_grad():
+            outputs = model.generate(**gen_kwargs)
+        decoded = tokenizer.batch_decode(outputs, skip_special_tokens=True)
+        # outputs will be (batch_size * num_return_sequences,)
+        # we requested num_return_sequences=1 => length matches batch
+        return decoded
+    except Exception as e:
+        print("[WARN] paraphrase_batch failed:", e)
+        return sentences  # fallback: return originals
+
+def augment_rare_classes_once(df_train: pd.DataFrame, cfg) -> pd.DataFrame:
+    """
+    Checks cache; if absent, paraphrases rare classes in batches and saves cached augmented dataset.
+    Returns augmented train dataframe.
+    """
+    cache_path = cfg["aug_cache_path"]
+    if cfg["use_t5_aug"] and os.path.exists(cache_path):
+        print("[INFO] Found augmented cache at", cache_path, "- loading it.")
+        return pd.read_csv(cache_path)
+
+    if not cfg["use_t5_aug"]:
+        print("[INFO] use_t5_aug set to False: skipping augmentation.")
+        return df_train
+
+    counts = df_train["lvl2_id"].value_counts()
+    rare_classes = counts[counts <= cfg["augment_min_samples"]].index.tolist()
+    if len(rare_classes) == 0:
+        print("[INFO] No rare classes found; skipping augmentation.")
+        return df_train
+
+    model, tokenizer, device = build_paraphraser(cfg)
+
+    # build subset of rare samples to augment
+    rare_df = df_train[df_train["lvl2_id"].isin(rare_classes)].reset_index(drop=True)
+    texts = rare_df["text"].tolist()
+    lvl1_ids = rare_df["lvl1_id"].tolist()
+    lvl2_ids = rare_df["lvl2_id"].tolist()
+
+    new_rows = []
+    batch_size = cfg.get("paraphrase_batch_size", 32)
+    print(f"[INFO] Paraphrasing {len(texts)} rare samples in batches of {batch_size} ...")
+    for i in tqdm(range(0, len(texts), batch_size)):
+        batch_texts = texts[i:i+batch_size]
+        paras = paraphrase_batch(model, tokenizer, device, batch_texts, cfg)
+        # we may want to create multiple augmented copies per original (augment_factor)
+        for j, p in enumerate(paras):
+            orig_idx = i + j
+            for _ in range(cfg["augment_factor"]):
+                new_rows.append({
+                    "text": p,
+                    "lvl1_id": int(lvl1_ids[orig_idx]),
+                    "lvl2_id": int(lvl2_ids[orig_idx])
+                })
+
+    if len(new_rows) > 0:
+        aug_df = pd.concat([df_train, pd.DataFrame(new_rows)], ignore_index=True)
+        # keep original label columns if present (for compatibility)
+        # attempt to preserve lvl label names if available
+        # Save cache (without extra big metadata)
+        aug_df.to_csv(cache_path, index=False)
+        print(f"[INFO] Augmentation complete — added {len(new_rows)} rows. Saved cache to {cache_path}")
+        return aug_df
+
+    print("[INFO] No augmented rows created.")
+    return df_train
 
 # -----------------------
 # Dataset
@@ -131,13 +226,12 @@ class NewsHierDataset(Dataset):
             max_length=self.max_len,
             return_tensors="pt"
         )
-        item = {
+        return {
             "input_ids": enc["input_ids"].squeeze(0),
             "attention_mask": enc["attention_mask"].squeeze(0),
             "lvl1": torch.tensor(self.lvl1_ids[idx], dtype=torch.long),
             "lvl2": torch.tensor(self.lvl2_ids[idx], dtype=torch.long),
         }
-        return item
 
 # -----------------------
 # Model (shared encoder + two heads)
@@ -153,7 +247,6 @@ class HierarchicalClassifier(nn.Module):
         self.classifier_lvl1 = nn.Linear(hidden_size, num_lvl1)
         self.classifier_lvl2 = nn.Linear(hidden_size, num_lvl2)
 
-        # init heads
         nn.init.xavier_uniform_(self.classifier_lvl1.weight)
         nn.init.xavier_uniform_(self.classifier_lvl2.weight)
         if self.classifier_lvl1.bias is not None:
@@ -162,27 +255,20 @@ class HierarchicalClassifier(nn.Module):
             nn.init.zeros_(self.classifier_lvl2.bias)
 
     def forward(self, input_ids, attention_mask):
-        # encoder returns last_hidden_state and optionally pooled output depending on model; for DeBERTa we use pooler if present or mean pooling
         outputs = self.encoder(input_ids=input_ids, attention_mask=attention_mask, return_dict=True)
-        # try to use pooled output if exists else mean pool
-        pooled = None
         if hasattr(outputs, "pooler_output") and outputs.pooler_output is not None:
             pooled = outputs.pooler_output
         else:
-            # mean pool over tokens weighted by attention
-            last_hidden = outputs.last_hidden_state  # (B, L, H)
-            attn = attention_mask.unsqueeze(-1).expand_as(last_hidden)  # (B, L, H)
-            sum_emb = (last_hidden * attn).sum(1)
-            denom = attn.sum(1).clamp(min=1e-9)
-            pooled = sum_emb / denom
-
+            last_hidden = outputs.last_hidden_state
+            attn = attention_mask.unsqueeze(-1).expand_as(last_hidden)
+            pooled = (last_hidden * attn).sum(1) / attn.sum(1).clamp(min=1e-9)
         pooled = self.dropout(pooled)
         logits1 = self.classifier_lvl1(pooled)
         logits2 = self.classifier_lvl2(pooled)
         return logits1, logits2
 
 # -----------------------
-# Losses: CrossEntropy with class weights + optional FocalLoss
+# Losses
 # -----------------------
 class FocalLoss(nn.Module):
     def __init__(self, gamma=2.0, weight=None, reduction="mean"):
@@ -193,7 +279,7 @@ class FocalLoss(nn.Module):
         self.ce = nn.CrossEntropyLoss(weight=weight, reduction="none")
 
     def forward(self, logits, targets):
-        logpt = -self.ce(logits, targets)  # negative CE (per example)
+        logpt = -self.ce(logits, targets)
         pt = torch.exp(logpt)
         loss = ((1 - pt) ** self.gamma) * (-logpt)
         if self.reduction == "mean":
@@ -203,34 +289,24 @@ class FocalLoss(nn.Module):
         return loss
 
 # -----------------------
-# Training & evaluation functions
+# Sampler + utilities
 # -----------------------
-def build_sampler(df_train: pd.DataFrame, label_col: str):
+def build_sampler(df_train: pd.DataFrame, label_col: str, device: str):
     counts = df_train[label_col].value_counts()
     class_weights = 1.0 / counts
     sample_weights = df_train[label_col].map(class_weights).values
     sampler = WeightedRandomSampler(weights=sample_weights, num_samples=len(sample_weights), replacement=True)
-    # return sample weights and class weights mapping also
-    class_weight_tensor = torch.tensor([class_weights.get(i, 0.0) for i in sorted(counts.index)], dtype=torch.float)
-    return sampler, class_weight_tensor.to(CONFIG["device"])
+    # build class weight vector ordered by label index (0..C-1)
+    max_label = int(df_train[label_col].max())
+    class_weight_tensor = torch.ones(max_label + 1, dtype=torch.float)
+    for lbl, w in class_weights.items():
+        class_weight_tensor[int(lbl)] = float(w)
+    return sampler, class_weight_tensor.to(device)
 
 def freeze_bottom_layers(model: HierarchicalClassifier, freeze_layers: int):
-    """
-    Freeze bottom `freeze_layers` transformer layers (encoder.model.encoder.layer[0:freeze_layers]).
-    Works for DeBERTa-like architectures which expose encoder.layer
-    """
-    # try to find encoder layers attribute for many HF models
-    # handle DeBERTa: model.encoder.encoder.layer
-    layers = None
-    enc = model.encoder
-    if hasattr(enc, "encoder") and hasattr(enc.encoder, "layer"):
-        layers = enc.encoder.layer
-    elif hasattr(enc, "layer"):
-        layers = enc.layer
-    else:
-        # unknown architecture — do not freeze
+    layers = getattr(getattr(model.encoder, "encoder", None), "layer", None)
+    if layers is None:
         return
-    # freeze bottom layers
     for i, layer in enumerate(layers):
         if i < freeze_layers:
             for p in layer.parameters():
@@ -240,7 +316,10 @@ def unfreeze_all(model: HierarchicalClassifier):
     for p in model.parameters():
         p.requires_grad = True
 
-def evaluate(model: HierarchicalClassifier, dataloader: DataLoader, device: str, le1: LabelEncoder, le2: LabelEncoder):
+# -----------------------
+# Evaluation
+# -----------------------
+def evaluate(model: HierarchicalClassifier, dataloader: DataLoader, device: str):
     model.eval()
     preds1, preds2, true1, true2 = [], [], [], []
     with torch.no_grad():
@@ -250,21 +329,19 @@ def evaluate(model: HierarchicalClassifier, dataloader: DataLoader, device: str,
             l1 = batch["lvl1"].to(device)
             l2 = batch["lvl2"].to(device)
             logits1, logits2 = model(ids, mask)
-            p1 = torch.argmax(logits1, dim=1)
-            p2 = torch.argmax(logits2, dim=1)
-            preds1.extend(p1.cpu().numpy())
-            preds2.extend(p2.cpu().numpy())
+            preds1.extend(torch.argmax(logits1, dim=1).cpu().numpy())
+            preds2.extend(torch.argmax(logits2, dim=1).cpu().numpy())
             true1.extend(l1.cpu().numpy())
             true2.extend(l2.cpu().numpy())
-    acc1 = accuracy_score(true1, preds1)
-    acc2 = accuracy_score(true2, preds2)
-    f1_1 = f1_score(true1, preds1, average="macro")
-    f1_2 = f1_score(true2, preds2, average="macro")
-    return {"lvl1_acc": acc1, "lvl2_acc": acc2, "lvl1_macro_f1": f1_1, "lvl2_macro_f1": f1_2,
-            "preds2": preds2, "true2": true2}
+    return {
+        "lvl1_acc": accuracy_score(true1, preds1),
+        "lvl2_acc": accuracy_score(true2, preds2),
+        "lvl1_macro_f1": f1_score(true1, preds1, average="macro"),
+        "lvl2_macro_f1": f1_score(true2, preds2, average="macro")
+    }
 
 # -----------------------
-# Main training routine for one seed
+# Train single seed
 # -----------------------
 def train_one_seed(seed: int, cfg: Dict, df: pd.DataFrame, le1: LabelEncoder, le2: LabelEncoder):
     set_seed(seed)
@@ -273,71 +350,34 @@ def train_one_seed(seed: int, cfg: Dict, df: pd.DataFrame, le1: LabelEncoder, le
     # split
     train_df, val_df = train_test_split(df, test_size=0.15, stratify=df["lvl2_id"], random_state=seed)
 
-    # augmentation for rare classes (optional)
-    if cfg["use_t5_aug"]:
-        # create paraphraser
-        print("[INFO] Building T5 paraphraser (may be slow)...")
-        t5para = T5Paraphraser(model_name=cfg["t5_aug_model"], device=device)
-        # find rare classes
-        counts = train_df["lvl2_id"].value_counts()
-        rare_classes = counts[counts <= cfg["augment_min_samples"]].index.tolist()
-        if len(rare_classes) > 0:
-            new_rows = []
-            for cls in tqdm(rare_classes, desc="Paraphrasing rare classes"):
-                subset = train_df[train_df["lvl2_id"] == cls]
-                for _, row in subset.iterrows():
-                    for _ in range(cfg["augment_factor"]):
-                        try:
-                            paras = t5para.paraphrase(row["text"], num_return_sequences=1)
-                            new_text = paras[0] if len(paras) > 0 else row["text"]
-                            new_rows.append({
-                                "text": new_text,
-                                "lvl1_id": row["lvl1_id"],
-                                "lvl2_id": row["lvl2_id"]
-                            })
-                        except Exception as e:
-                            # on error, skip aug
-                            continue
-            if len(new_rows) > 0:
-                aug_df = pd.DataFrame(new_rows)
-                # append to train
-                train_df = pd.concat([train_df, aug_df], ignore_index=True)
-                print(f"[INFO] Added {len(new_rows)} augmented rows. New train size: {len(train_df)}")
-
     # tokenizer + datasets
     tokenizer = AutoTokenizer.from_pretrained(cfg["model_name"])
     train_dataset = NewsHierDataset(train_df["text"].tolist(), train_df["lvl1_id"].tolist(), train_df["lvl2_id"].tolist(), tokenizer, max_len=cfg["max_len"])
     val_dataset = NewsHierDataset(val_df["text"].tolist(), val_df["lvl1_id"].tolist(), val_df["lvl2_id"].tolist(), tokenizer, max_len=cfg["max_len"])
 
-    # sampler for lvl2
-    sampler, class_weight_tensor = build_sampler(train_df, "lvl2_id")
-
+    # sampler + loaders
+    sampler, class_weight_tensor = build_sampler(train_df, "lvl2_id", device)
     train_loader = DataLoader(train_dataset, batch_size=cfg["batch_size"], sampler=sampler, num_workers=cfg["num_workers"])
     val_loader = DataLoader(val_dataset, batch_size=cfg["batch_size"], shuffle=False, num_workers=cfg["num_workers"])
 
-    # model initialization
-    num_lvl1 = len(le1.classes_)
-    num_lvl2 = len(le2.classes_)
-    model = HierarchicalClassifier(cfg["model_name"], num_lvl1=num_lvl1, num_lvl2=num_lvl2).to(device)
-
-    # freeze bottom layers for warmup epoch
+    # model init
+    num_lvl1, num_lvl2 = len(le1.classes_), len(le2.classes_)
+    model = HierarchicalClassifier(cfg["model_name"], num_lvl1, num_lvl2).to(device)
     freeze_bottom_layers(model, cfg["freeze_layers"])
 
-    # optimizer + scheduler
     optimizer = AdamW(filter(lambda p: p.requires_grad, model.parameters()), lr=cfg["lr"], weight_decay=cfg["weight_decay"], eps=1e-8)
-    total_steps = math.ceil(len(train_loader) / 1.0) * cfg["num_epochs"]  # approximate - accumulation handled separately
+    total_steps = math.ceil(len(train_loader) * cfg["num_epochs"] / cfg["accumulation_steps"])
     warmup_steps = int(cfg["warmup_proportion"] * total_steps)
     scheduler = get_cosine_schedule_with_warmup(optimizer, num_warmup_steps=warmup_steps, num_training_steps=total_steps)
 
     # losses
     if cfg["use_focal_loss"]:
-        loss_lvl2 = FocalLoss(gamma=cfg["focal_loss_gamma"], weight=class_weight_tensor)
+        loss_lvl2 = FocalLoss(cfg["focal_loss_gamma"], class_weight_tensor)
     else:
         loss_lvl2 = nn.CrossEntropyLoss(weight=class_weight_tensor)
-    # level-1 class weight (optional: balance by lvl1 freq)
     lvl1_counts = train_df["lvl1_id"].value_counts()
-    lvl1_class_weights = 1.0 / lvl1_counts
-    lvl1_weight_tensor = torch.tensor([lvl1_class_weights.get(i, 0.0) for i in sorted(lvl1_counts.index)], dtype=torch.float).to(device)
+    lvl1_weights = {i: 1.0/lvl1_counts.get(i, 1.0) for i in range(len(le1.classes_))}
+    lvl1_weight_tensor = torch.tensor([lvl1_weights[i] for i in range(len(le1.classes_))], dtype=torch.float).to(device)
     loss_lvl1 = nn.CrossEntropyLoss(weight=lvl1_weight_tensor)
 
     scaler = GradScaler()
@@ -346,19 +386,16 @@ def train_one_seed(seed: int, cfg: Dict, df: pd.DataFrame, le1: LabelEncoder, le
     os.makedirs(model_dir, exist_ok=True)
 
     # training loop
-    global_step = 0
     for epoch in range(cfg["num_epochs"]):
         model.train()
-        running_loss = 0.0
-        optimizer.zero_grad()
-        # If epoch > 0, unfreeze all layers (we froze only for epoch 0)
         if epoch == 1:
-            print("[INFO] Unfreezing all layers.")
+            print("[INFO] Unfreezing all layers for full fine-tuning.")
             unfreeze_all(model)
-            # re-create optimizer because some params now require grad
             optimizer = AdamW(filter(lambda p: p.requires_grad, model.parameters()), lr=cfg["lr"], weight_decay=cfg["weight_decay"], eps=1e-8)
             scheduler = get_cosine_schedule_with_warmup(optimizer, num_warmup_steps=warmup_steps, num_training_steps=total_steps)
 
+        running_loss = 0.0
+        optimizer.zero_grad()
         pbar = tqdm(enumerate(train_loader), total=len(train_loader), desc=f"Seed {seed} Epoch {epoch+1}")
         for step, batch in pbar:
             ids = batch["input_ids"].to(device)
@@ -366,12 +403,13 @@ def train_one_seed(seed: int, cfg: Dict, df: pd.DataFrame, le1: LabelEncoder, le
             y1 = batch["lvl1"].to(device)
             y2 = batch["lvl2"].to(device)
 
-            with autocast():
+            # proper autocast device selection
+            autocast_device = "cuda" if device.startswith("cuda") else "cpu"
+            with amp.autocast(device_type=autocast_device):
                 logits1, logits2 = model(ids, mask)
-                loss1 = loss_lvl1(logits1, y1)
-                loss2 = loss_lvl2(logits2, y2)
-                # multi-task weighting: emphasize level2 a bit more if you want
-                loss = 0.5 * loss1 + 1.0 * loss2
+                l1 = loss_lvl1(logits1, y1)
+                l2 = loss_lvl2(logits2, y2)
+                loss = 0.5 * l1 + 1.0 * l2
 
             scaler.scale(loss / cfg["accumulation_steps"]).backward()
             running_loss += loss.item()
@@ -381,110 +419,95 @@ def train_one_seed(seed: int, cfg: Dict, df: pd.DataFrame, le1: LabelEncoder, le
                 scaler.update()
                 optimizer.zero_grad()
                 scheduler.step()
-                global_step += 1
 
             if (step + 1) % 200 == 0:
                 pbar.set_postfix({"loss": running_loss / (step + 1)})
 
-        # end epoch: evaluate
-        val_metrics = evaluate(model, val_loader, device, le1, le2)
-        print(f"[Seed {seed}] Epoch {epoch+1} Validation: lvl1_acc={val_metrics['lvl1_acc']:.4f} lvl2_acc={val_metrics['lvl2_acc']:.4f} lvl2_macro_f1={val_metrics['lvl2_macro_f1']:.4f}")
+        # validation
+        val_metrics = evaluate(model, val_loader, device)
+        print(f"[Seed {seed}] Epoch {epoch+1} Validation: lvl2_macro_f1={val_metrics['lvl2_macro_f1']:.4f} lvl2_acc={val_metrics['lvl2_acc']:.4f}")
 
-        # checkpoint best by level2 macro f1
         if val_metrics["lvl2_macro_f1"] > best_val_f1:
             best_val_f1 = val_metrics["lvl2_macro_f1"]
-            save_path = os.path.join(model_dir, "best_model.pt")
-            print(f"[Seed {seed}] New best lvl2_macro_f1={best_val_f1:.4f} — saving model to {save_path}")
             torch.save({
                 "model_state_dict": model.state_dict(),
                 "optimizer_state_dict": optimizer.state_dict(),
                 "scheduler_state_dict": scheduler.state_dict(),
-                "cfg": cfg,
-                "le1_classes": le1.classes_.tolist(),
-                "le2_classes": le2.classes_.tolist()
-            }, save_path)
+                "cfg": cfg
+            }, os.path.join(model_dir, "best_model.pt"))
+            # also save tokenizer
+            tokenizer.save_pretrained(model_dir)
 
-    # save tokenizer and final config
-    tokenizer.save_pretrained(model_dir)
-    return model_dir  # return directory where best model is saved
+    return model_dir
 
 # -----------------------
 # Ensemble inference
 # -----------------------
 def load_model_for_inference(model_dir: str, cfg: Dict, device: str, num_lvl1: int, num_lvl2: int):
-    # load tokenizer from model_dir (saved earlier) if present
-    tokenizer = AutoTokenizer.from_pretrained(model_dir) if os.path.isdir(model_dir) and os.path.exists(os.path.join(model_dir, "tokenizer_config.json")) else AutoTokenizer.from_pretrained(cfg["model_name"])
-    model = HierarchicalClassifier(cfg["model_name"], num_lvl1=num_lvl1, num_lvl2=num_lvl2)
+    tokenizer = AutoTokenizer.from_pretrained(model_dir)
+    model = HierarchicalClassifier(cfg["model_name"], num_lvl1, num_lvl2).to(device)
     ckpt = torch.load(os.path.join(model_dir, "best_model.pt"), map_location=device)
     model.load_state_dict(ckpt["model_state_dict"])
-    model.to(device)
     model.eval()
     return tokenizer, model
 
 def ensemble_predict(texts: List[str], model_dirs: List[str], cfg: Dict, le1: LabelEncoder, le2: LabelEncoder):
     device = cfg["device"]
-    # load all models + tokenizers
-    models = []
-    tokenizers = []
+    tokenizers, models = [], []
     for d in model_dirs:
-        tokenizer, model = load_model_for_inference(d, cfg, device, num_lvl1=len(le1.classes_), num_lvl2=len(le2.classes_))
-        tokenizers.append(tokenizer)
-        models.append(model)
+        tok, mdl = load_model_for_inference(d, cfg, device, len(le1.classes_), len(le2.classes_))
+        tokenizers.append(tok); models.append(mdl)
 
-    # tokenize with first tokenizer (all tokenizers same config/size normally)
-    tok = tokenizers[0]
-    enc = tok(texts, truncation=True, padding=True, max_length=cfg["max_len"], return_tensors="pt")
-    input_ids = enc["input_ids"].to(device)
-    attention_mask = enc["attention_mask"].to(device)
+    enc = tokenizers[0](texts, truncation=True, padding=True, max_length=cfg["max_len"], return_tensors="pt")
+    input_ids, attention_mask = enc["input_ids"].to(device), enc["attention_mask"].to(device)
 
-    # collect logits
-    logits1_list = []
-    logits2_list = []
+    logits1_list, logits2_list = [], []
     with torch.no_grad():
         for model in models:
             l1, l2 = model(input_ids, attention_mask)
             logits1_list.append(l1.cpu().numpy())
             logits2_list.append(l2.cpu().numpy())
 
-    # average
     avg_logits1 = np.mean(np.stack(logits1_list, axis=0), axis=0)
     avg_logits2 = np.mean(np.stack(logits2_list, axis=0), axis=0)
-
     preds1 = np.argmax(avg_logits1, axis=1)
     preds2 = np.argmax(avg_logits2, axis=1)
-
-    lvl1_preds = le1.inverse_transform(preds1)
-    lvl2_preds = le2.inverse_transform(preds2)
-    return lvl1_preds, lvl2_preds
+    return le1.inverse_transform(preds1), le2.inverse_transform(preds2)
 
 # -----------------------
-# Run full training (multi-seed) and ensemble
+# Run full pipeline (with augmentation once)
 # -----------------------
 def run_full_pipeline(cfg: Dict):
     df, le1, le2 = load_and_prepare_df(cfg)
-    print("[INFO] Loaded dataset: total rows =", len(df))
+    print("[INFO] Loaded dataset:", len(df), "rows")
     print("[INFO] Level-1 classes:", len(le1.classes_), "Level-2 classes:", len(le2.classes_))
 
+    # Perform augmentation ONCE (cached)
+    if cfg["use_t5_aug"]:
+        print("[INFO] Starting augmentation (cached). This will run only if cache absent.")
+        df_aug = augment_rare_classes_once(df, cfg)
+    else:
+        df_aug = df
+
+    # Train per-seed
     model_dirs = []
     for seed in cfg["seeds"]:
         print(f"\n========== TRAINING SEED {seed} ==========")
-        model_dir = train_one_seed(seed, cfg, df, le1, le2)
+        model_dir = train_one_seed(seed, cfg, df_aug, le1, le2)
         model_dirs.append(model_dir)
 
-    # Sanity check: ensemble on validation (we'll do a quick val sample)
-    # Build a small val set
-    _, val_df = train_test_split(df, test_size=0.15, stratify=df["lvl2_id"], random_state=cfg["seeds"][0])
-    sample_texts = val_df["text"].tolist()[:512]  # up to 512 to keep memory moderate
+    # Quick ensemble check on validation subset
+    _, val_df = train_test_split(df_aug, test_size=0.15, stratify=df_aug["lvl2_id"], random_state=cfg["seeds"][0])
+    sample_texts = val_df["text"].tolist()[:512]
     lvl1_preds, lvl2_preds = ensemble_predict(sample_texts, model_dirs, cfg, le1, le2)
-    print("[INFO] Ensemble produced", len(lvl2_preds), "predictions. Example (first 10):")
+    print("[INFO] Ensemble example predictions (first 10):")
     for i in range(min(10, len(lvl2_preds))):
-        print(f"Pred L1: {lvl1_preds[i]}  Pred L2: {lvl2_preds[i]}")
+        print(f" L1: {lvl1_preds[i]}  L2: {lvl2_preds[i]}")
 
-    print("\nALL DONE. Models saved to:", cfg["output_dir"])
-    print("To run inference, use ensemble_predict(texts, model_dirs, CONFIG, le1, le2)")
+    print("[INFO] All done. Models saved to", cfg["output_dir"])
 
 # -----------------------
-# Entry point
+# Entry
 # -----------------------
 if __name__ == "__main__":
     run_full_pipeline(CONFIG)

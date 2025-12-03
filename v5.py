@@ -10,7 +10,8 @@ import torch
 import torch.nn as nn
 from torch import amp
 from torch.utils.data import Dataset, DataLoader, WeightedRandomSampler
-from torch.cuda.amp import GradScaler
+from torch.amp import GradScaler
+
 
 from transformers import (
     AutoTokenizer,
@@ -398,7 +399,7 @@ def train_one_seed(seed: int, cfg: Dict, df: pd.DataFrame, le1: LabelEncoder, le
     lvl1_weight_tensor = torch.tensor([lvl1_weights[i] for i in range(len(le1.classes_))], dtype=torch.float).to(device)
     loss_lvl1 = nn.CrossEntropyLoss(weight=lvl1_weight_tensor)
 
-    scaler = GradScaler()
+    scaler = GradScaler("cuda")
     best_val_f1 = -1.0
     model_dir = os.path.join(cfg["output_dir"], f"seed_{seed}")
     os.makedirs(model_dir, exist_ok=True)

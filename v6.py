@@ -1,19 +1,3 @@
-#!/usr/bin/env python3
-"""
-Grandmaster Final pipeline — pretrained encoder + two-head hierarchical finetune.
-
-Drop-in single file:
-- Uses HF pretrained encoder (configurable)
-- Shared encoder + two classification heads
-- Class-balanced sampling, focal loss option
-- Mixed precision (torch.amp), GradScaler (correct API)
-- Layer freezing warmup then unfreeze
-- OneCycleLR scheduler with warmup
-- Gradient accumulation + clipping
-- SWA optional for final epochs
-- Multi-seed ensembling
-"""
-
 import os, math, random, time, json
 from typing import List, Dict, Tuple
 from collections import Counter
@@ -35,9 +19,9 @@ from transformers import (
     AutoTokenizer,
     AutoModel,
     AutoConfig,
-    AdamW,
     get_linear_schedule_with_warmup,
 )
+from torch.optim import AdamW
 
 # -----------------------
 # CONFIG — tune these

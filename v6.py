@@ -85,9 +85,7 @@ def set_seed(seed: int):
 
 def simple_tokenize(text: str) -> List[str]:
     # basic whitespace + punctuation separation (lightweight)
-    # you can replace with a better local tokenizer if desired
     text = str(text).lower()
-    # keep punctuation as separate tokens
     chars = []
     token = []
     for ch in text:
@@ -101,7 +99,6 @@ def simple_tokenize(text: str) -> List[str]:
                 chars.append(ch)
     if token:
         chars.append(''.join(token))
-    # filter spaces tokens
     tokens = [t for t in chars if t.strip()]
     return tokens
 
@@ -113,11 +110,9 @@ def build_vocab(texts: List[str], cfg: Dict):
     for t in texts:
         tokens = simple_tokenize(t)
         counter.update(tokens)
-    # filter by min_freq and top-k
     tokens_and_freq = [(tok, freq) for tok, freq in counter.items() if freq >= cfg["min_freq"]]
     tokens_and_freq.sort(key=lambda x: x[1], reverse=True)
     topk = tokens_and_freq[:cfg["vocab_size"]]
-    # special tokens
     vocab = {"<PAD>": 0, "<UNK>": 1}
     idx = 2
     for tok, _ in topk:
@@ -128,7 +123,6 @@ def build_vocab(texts: List[str], cfg: Dict):
 def text_to_ids(text: str, vocab: Dict[str,int], max_len: int):
     tokens = simple_tokenize(text)
     ids = [vocab.get(t, vocab["<UNK>"]) for t in tokens][:max_len]
-    # padding handled in collate
     return ids
 
 # -----------------------
@@ -156,7 +150,6 @@ class NewsLocalDataset(Dataset):
         }
 
 def collate_fn(batch, pad_id=0, max_len=None):
-    # batch: list of dicts
     lengths = [b["length"] for b in batch]
     max_l = max(lengths) if max_len is None else min(max(lengths), max_len)
     padded = []
@@ -185,7 +178,7 @@ class HierLocalModel(nn.Module):
         self.encoder = nn.LSTM(input_size=emb_dim, hidden_size=enc_hidden, num_layers=num_layers, batch_first=True, bidirectional=True, dropout=dropout if num_layers>1 else 0.0)
         self.dropout = nn.Dropout(dropout)
         hidden_size = enc_hidden * 2  # bidirectional
-        # pooling projections
+        # pooling projection (input = hidden_size)
         self.proj = nn.Linear(hidden_size, hidden_size)
         # heads
         self.head1 = nn.Linear(hidden_size, num_lvl1)
@@ -202,13 +195,29 @@ class HierLocalModel(nn.Module):
         # input_ids: (B, L)
         emb = self.embedding(input_ids)               # (B, L, E)
         outputs, _ = self.encoder(emb)               # (B, L, 2H)
-        # attention_mask optional; do mean + max pooling
+
+        # attention_mask optional; do mean + max pooling (max computed safely)
         mask = (input_ids != 0).unsqueeze(-1).float()  # (B,L,1)
+
+        # mean pool (works fine in float16 or float32)
         summed = (outputs * mask).sum(1)              # (B, 2H)
         denom = mask.sum(1).clamp(min=1e-9)
         mean_pool = summed / denom                    # (B,2H)
-        max_pool, _ = (outputs.masked_fill(mask==0, -1e9)).max(1)  # (B,2H)
-        pooled = torch.cat([mean_pool, max_pool], dim=1) if False else mean_pool  # choose mean or concat
+
+        # compute max-pool safely in float32 to avoid float16 overflow in masked_fill
+        outputs_fp32 = outputs.float()
+        mask_fp32 = mask.float()
+        masked = outputs_fp32.masked_fill(mask_fp32 == 0, -1e9)
+        max_pool, _ = masked.max(1)                   # (B,2H)
+        # convert back to outputs dtype (handles float16 case)
+        max_pool = max_pool.to(outputs.dtype)
+
+        # choose pooling strategy: using mean_pool by default (safer, smaller proj)
+        pooled = mean_pool
+        # if you want to use concatenated mean+max, replace above with:
+        # pooled = torch.cat([mean_pool, max_pool], dim=1)
+        # and update self.proj input dim accordingly.
+
         # project
         feat = torch.tanh(self.proj(self.dropout(pooled)))  # (B, 2H)
         logits1 = self.head1(feat)
@@ -286,7 +295,6 @@ def train_one_seed(seed: int, cfg: Dict, df: pd.DataFrame, le1: LabelEncoder, le
     train_df, val_df = train_test_split(df, test_size=0.15, stratify=df["lvl2_id"], random_state=seed)
 
     # datasets
-    tokenizer = None  # we use local vocab
     train_ds = NewsLocalDataset(train_df["text"].tolist(), train_df["lvl1_id"].tolist(), train_df["lvl2_id"].tolist(), vocab, cfg["max_len"])
     val_ds = NewsLocalDataset(val_df["text"].tolist(), val_df["lvl1_id"].tolist(), val_df["lvl2_id"].tolist(), vocab, cfg["max_len"])
 
@@ -298,7 +306,7 @@ def train_one_seed(seed: int, cfg: Dict, df: pd.DataFrame, le1: LabelEncoder, le
     num_lvl2 = len(le2.classes_)
     model = HierLocalModel(len(vocab), cfg["embedding_dim"], cfg["encoder_hidden"], num_lvl1, num_lvl2, emb_weights, dropout=cfg["dropout"], num_layers=cfg["encoder_layers"]).to(device)
 
-    # optionally freeze embeddings/encoder for first epoch(s)
+    # optionally freeze embeddings for first epoch(s)
     if cfg["freeze_epochs"] > 0:
         for name, p in model.named_parameters():
             if "embedding" in name:
@@ -307,7 +315,6 @@ def train_one_seed(seed: int, cfg: Dict, df: pd.DataFrame, le1: LabelEncoder, le
     optimizer = torch.optim.AdamW(filter(lambda p: p.requires_grad, model.parameters()), lr=cfg["lr"], weight_decay=cfg["weight_decay"])
     total_steps = math.ceil(len(train_loader) * cfg["num_epochs"] / cfg["accumulation_steps"])
     warmup_steps = int(cfg["warmup_proportion"] * total_steps)
-    # simple scheduler: cosine with warmup
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=max(1, total_steps - warmup_steps))
 
     # loss
@@ -320,10 +327,15 @@ def train_one_seed(seed: int, cfg: Dict, df: pd.DataFrame, le1: LabelEncoder, le
     lvl1_weights = torch.tensor([1.0 / lvl1_counts.get(i, 1.0) for i in range(len(le1.classes_))], dtype=torch.float, device=device)
     loss_lvl1 = nn.CrossEntropyLoss(weight=lvl1_weights)
 
-    scaler = GradScaler()
+    # GradScaler: prefer explicit device_type to silence FutureWarning
+    scaler = GradScaler(device_type="cuda") if torch.cuda.is_available() else GradScaler()
+
     best_val_f1 = -1.0
     model_dir = os.path.join(cfg["save_dir"], f"seed_{seed}")
     os.makedirs(model_dir, exist_ok=True)
+
+    # choose autocast device type
+    autocast_device = "cuda" if device.startswith("cuda") else "cpu"
 
     for epoch in range(cfg["num_epochs"]):
         model.train()
@@ -342,7 +354,6 @@ def train_one_seed(seed: int, cfg: Dict, df: pd.DataFrame, le1: LabelEncoder, le
             y1 = batch["lvl1"].to(device)
             y2 = batch["lvl2"].to(device)
 
-            autocast_device = "cuda" if device.startswith("cuda") else "cpu"
             with amp.autocast(device_type=autocast_device):
                 logits1, logits2 = model(ids)
                 l1 = loss_lvl1(logits1, y1)
@@ -356,7 +367,6 @@ def train_one_seed(seed: int, cfg: Dict, df: pd.DataFrame, le1: LabelEncoder, le
                 scaler.step(optimizer)
                 scaler.update()
                 optimizer.zero_grad()
-                # scheduler step per optimizer step
                 try:
                     scheduler.step()
                 except Exception:
@@ -378,7 +388,6 @@ def train_one_seed(seed: int, cfg: Dict, df: pd.DataFrame, le1: LabelEncoder, le
                 "cfg": cfg,
                 "vocab": vocab
             }, os.path.join(model_dir, "best_model.pt"))
-            # save simple metadata
             with open(os.path.join(model_dir, "meta.json"), "w") as f:
                 json.dump({"seed": seed, "num_lvl1": num_lvl1, "num_lvl2": num_lvl2}, f)
 
@@ -395,7 +404,6 @@ def load_local_model(model_dir: str, cfg: Dict):
     with open(os.path.join(model_dir, "vocab.json"), "r") as f:
         vocab = json.load(f)
     meta = json.load(open(os.path.join(model_dir, "meta.json")))
-    # create model
     model = HierLocalModel(len(vocab), cfg["embedding_dim"], cfg["encoder_hidden"], meta["num_lvl1"], meta["num_lvl2"], emb_weights=None, dropout=cfg["dropout"], num_layers=cfg["encoder_layers"])
     ckpt = torch.load(os.path.join(model_dir, "best_model.pt"), map_location=cfg["device"])
     model.load_state_dict(ckpt["model_state_dict"])
@@ -412,11 +420,8 @@ def ensemble_predict(texts: List[str], model_dirs: List[str], cfg: Dict, le1: La
         models.append(m)
         vocabs.append(v)
 
-    # For simplicity, use first vocab to tokenize (we saved same vocab each seed)
     vocab = vocabs[0]
-    # tokenization
     all_ids = [text_to_ids(t, vocab, cfg["max_len"]) for t in texts]
-    # pad
     pad_id = vocab.get("<PAD>", 0)
     maxlen = max(len(x) for x in all_ids)
     padded = [x + [pad_id]*(maxlen - len(x)) for x in all_ids]
@@ -459,11 +464,9 @@ def run_full_pipeline(cfg: Dict):
         json.dump(vocab, f)
     print("[INFO] Vocab size:", len(vocab))
 
-    # optional load pretrained embeddings if provided (user-supplied)
     emb_weights = None
     if cfg.get("pretrained_embedding_path") and cfg.get("pretrained_embedding_vocab"):
         emb_weights = np.load(cfg["pretrained_embedding_path"])
-        # user must ensure emb_weights shape == (vocab_size, emb_dim)
         emb_weights = torch.tensor(emb_weights, dtype=torch.float)
 
     model_dirs = []

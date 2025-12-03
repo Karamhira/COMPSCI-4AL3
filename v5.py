@@ -93,16 +93,27 @@ def load_and_prepare_df(cfg) -> Tuple[pd.DataFrame, LabelEncoder, LabelEncoder]:
 # -----------------------
 def build_paraphraser(cfg):
     """
-    Loads paraphraser model & tokenizer once.
-    Use T5Tokenizer(..., legacy=False) to suppress legacy warning.
+    Loads paraphraser model & tokenizer using ONLY the fast tokenizer.
+    This avoids protobuf + google imports entirely.
     """
+    from transformers import T5TokenizerFast, T5ForConditionalGeneration
+
     device = cfg["device"]
     print("[INFO] Loading paraphraser:", cfg["t5_aug_model"], "on", device)
-    tokenizer = T5Tokenizer.from_pretrained(cfg["t5_aug_model"], legacy=False)
+
+    # Force the fast tokenizer
+    tokenizer = T5TokenizerFast.from_pretrained(
+        cfg["t5_aug_model"],
+        legacy=False,       # silence warning
+        use_fast=True       # force fast tokenizer (NO protobuf)
+    )
+
     model = T5ForConditionalGeneration.from_pretrained(cfg["t5_aug_model"])
     model.to(device)
     model.eval()
+
     return model, tokenizer, device
+
 
 def paraphrase_batch(model, tokenizer, device, sentences: List[str], cfg) -> List[str]:
     """

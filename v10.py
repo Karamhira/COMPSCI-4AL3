@@ -124,11 +124,11 @@ class NewsDataset(Dataset):
             "input_ids": input_ids,
             "attention_mask": attention_mask,
             "label_lvl1": torch.tensor(self.labels_lvl1[idx], dtype=torch.long),
-            "label_lvl2": torch.tensor(self.labels_lvl2[idx], dtype=torch.long)
+            "label_lvl2": torch.tensor(self.labels_lvl2[idx], dtype=t.long)
         }
 
 # ----------------------------
-# Enhanced Attention pooling with residual
+# Enhanced Attention pooling with residual (FIXED FOR FP16)
 # ----------------------------
 class EnhancedAttentionPooling(nn.Module):
     def __init__(self, hidden_size):
@@ -144,7 +144,10 @@ class EnhancedAttentionPooling(nn.Module):
     def forward(self, hidden_states, mask):
         # Get attention scores
         scores = self.att(hidden_states).squeeze(-1)
-        scores = scores.masked_fill(mask == 0, -1e9)
+        
+        # Use a very small value that works with FP16
+        # -1e4 is safe for FP16 (max negative value is -65504)
+        scores = scores.masked_fill(mask == 0, -1e4)
         weights = torch.softmax(scores, dim=1)
         
         # Weighted sum
@@ -157,7 +160,7 @@ class EnhancedAttentionPooling(nn.Module):
         return pooled
 
 # ----------------------------
-# Enhanced Model with deeper classifiers
+# Enhanced Model with deeper classifiers (SIMPLIFIED)
 # ----------------------------
 class EnhancedHierarchicalRoberta(nn.Module):
     def __init__(self, num_labels_lvl1, num_labels_lvl2, pretrained_model=PRETRAINED_MODEL, dropouts=DROPOUTS):
@@ -171,37 +174,30 @@ class EnhancedHierarchicalRoberta(nn.Module):
         # Multi-dropout ensemble
         self.dropouts = nn.ModuleList([nn.Dropout(p) for p in dropouts])
         
-        # Enhanced Level1 classifier with residual
-        self.lvl1_pre = nn.Sequential(
+        # Simplified Level1 classifier
+        self.classifier_lvl1 = nn.Sequential(
             nn.Linear(hidden_size, 512),
             nn.GELU(),
-            nn.LayerNorm(512)
+            nn.Dropout(0.3),
+            nn.Linear(512, num_labels_lvl1)
         )
-        self.classifier_lvl1 = nn.Linear(512, num_labels_lvl1)
         
         # Enhanced Level2 classifier
-        self.lvl2_pre = nn.Sequential(
+        self.classifier_lvl2 = nn.Sequential(
             nn.Linear(hidden_size, 768),
             nn.GELU(),
-            nn.Dropout(0.2),
+            nn.Dropout(0.3),
             nn.Linear(768, 512),
             nn.GELU(),
-            nn.LayerNorm(512)
+            nn.Dropout(0.2),
+            nn.Linear(512, num_labels_lvl2)
         )
-        self.classifier_lvl2 = nn.Linear(512, num_labels_lvl2)
         
-        # Enhanced gate mechanism
-        self.gate_projection = nn.Sequential(
-            nn.Linear(num_labels_lvl1, 256),
-            nn.GELU(),
-            nn.Linear(256, num_labels_lvl2)
-        )
+        # Gate mechanism from Level1 to Level2
+        self.gate_projection = nn.Linear(num_labels_lvl1, num_labels_lvl2)
         
         # Learnable gate weight
-        self.gate_weight = nn.Parameter(torch.tensor(0.7))
-        
-        # Layer for combining features
-        self.feature_fusion = nn.Linear(hidden_size + num_labels_lvl1, hidden_size)
+        self.gate_weight = nn.Parameter(torch.tensor(0.5))
         
     def forward(self, input_ids, attention_mask):
         outputs = self.roberta(input_ids=input_ids, attention_mask=attention_mask)
@@ -213,26 +209,17 @@ class EnhancedHierarchicalRoberta(nn.Module):
             dropped = dropout(pooled)
             
             # Level1 predictions
-            lvl1_features = self.lvl1_pre(dropped)
-            logits1 = self.classifier_lvl1(lvl1_features)
+            logits1 = self.classifier_lvl1(dropped)
             
-            # Level2 predictions with enhanced features
-            lvl2_features = self.lvl2_pre(dropped)
+            # Level2 predictions with gate from Level1
+            logits2_base = self.classifier_lvl2(dropped)
             
-            # Enhanced gate: combine features from Level1 predictions
-            lvl1_probs = F.softmax(logits1, dim=-1)
-            gate_signal = torch.sigmoid(self.gate_projection(lvl1_probs))
-            
-            # Combine Level1 information with base features
-            combined_features = torch.cat([dropped, lvl1_probs], dim=-1)
-            fused_features = self.feature_fusion(combined_features)
-            
-            # Final Level2 logits
-            logits2_base = self.classifier_lvl2(lvl2_features)
-            logits2_gated = logits2_base * (1 + self.gate_weight * gate_signal)
+            # Gate signal from Level1
+            gate_signal = torch.sigmoid(self.gate_projection(logits1))
+            logits2 = logits2_base * (1 + self.gate_weight * gate_signal)
             
             logits1_all.append(logits1)
-            logits2_all.append(logits2_gated)
+            logits2_all.append(logits2)
         
         # Ensemble average
         logits1 = torch.stack(logits1_all, dim=0).mean(dim=0)
@@ -269,8 +256,8 @@ tokenizer = AutoTokenizer.from_pretrained(PRETRAINED_MODEL)
 train_ds = NewsDataset(X_train.tolist(), y1_train.tolist(), y2_train.tolist(), tokenizer, augment=True)
 val_ds = NewsDataset(X_val.tolist(), y1_val.tolist(), y2_val.tolist(), tokenizer, augment=False)
 
-train_loader = DataLoader(train_ds, batch_size=BATCH_SIZE, shuffle=True, num_workers=2, pin_memory=True)
-val_loader = DataLoader(val_ds, batch_size=BATCH_SIZE, shuffle=False, num_workers=2, pin_memory=True)
+train_loader = DataLoader(train_ds, batch_size=BATCH_SIZE, shuffle=True, pin_memory=True)
+val_loader = DataLoader(val_ds, batch_size=BATCH_SIZE, shuffle=False, pin_memory=True)
 
 # ----------------------------
 # Class weights & loss functions
@@ -289,9 +276,9 @@ weight_lvl2 = weight_lvl2 / weight_lvl2.mean()
 print(f"Level1 weight range: {weight_lvl1.min():.2f} - {weight_lvl1.max():.2f}")
 print(f"Level2 weight range: {weight_lvl2.min():.2f} - {weight_lvl2.max():.2f}")
 
-# Enhanced loss functions with focal loss for level2
+# Enhanced loss functions
 criterion_lvl1 = nn.CrossEntropyLoss(weight=weight_lvl1, label_smoothing=0.15)
-criterion_lvl2 = FocalLoss(alpha=0.75, gamma=2.0)  # Focal loss for imbalanced level2
+criterion_lvl2 = nn.CrossEntropyLoss(weight=weight_lvl2, label_smoothing=0.15)
 
 # ----------------------------
 # Model, optimizer, scheduler
@@ -304,36 +291,24 @@ model = EnhancedHierarchicalRoberta(
 
 print(f"Model parameters: {sum(p.numel() for p in model.parameters()):,}")
 
-# Separate optimizer groups with different learning rates
-no_decay = ["bias", "LayerNorm.weight"]
+# Optimizer with different learning rates
+param_optimizer = list(model.named_parameters())
+no_decay = ['bias', 'LayerNorm.weight']
 optimizer_grouped_parameters = [
-    {
-        "params": [p for n, p in model.roberta.named_parameters() if not any(nd in n for nd in no_decay)],
-        "lr": BACKBONE_LR,
-        "weight_decay": WEIGHT_DECAY
-    },
-    {
-        "params": [p for n, p in model.roberta.named_parameters() if any(nd in n for nd in no_decay)],
-        "lr": BACKBONE_LR,
-        "weight_decay": 0.0
-    },
-    {
-        "params": [p for n, p in model.named_parameters() if "roberta" not in n and not any(nd in n for nd in no_decay)],
-        "lr": CLASSIFIER_LR,
-        "weight_decay": WEIGHT_DECAY
-    },
-    {
-        "params": [p for n, p in model.named_parameters() if "roberta" not in n and any(nd in n for nd in no_decay)],
-        "lr": CLASSIFIER_LR,
-        "weight_decay": 0.0
-    },
+    {'params': [p for n, p in param_optimizer if 'roberta' in n and not any(nd in n for nd in no_decay)],
+     'lr': BACKBONE_LR, 'weight_decay': WEIGHT_DECAY},
+    {'params': [p for n, p in param_optimizer if 'roberta' in n and any(nd in n for nd in no_decay)],
+     'lr': BACKBONE_LR, 'weight_decay': 0.0},
+    {'params': [p for n, p in param_optimizer if 'roberta' not in n and not any(nd in n for nd in no_decay)],
+     'lr': CLASSIFIER_LR, 'weight_decay': WEIGHT_DECAY},
+    {'params': [p for n, p in param_optimizer if 'roberta' not in n and any(nd in n for nd in no_decay)],
+     'lr': CLASSIFIER_LR, 'weight_decay': 0.0}
 ]
 
 optimizer = AdamW(optimizer_grouped_parameters)
 
-# Cosine annealing scheduler
-steps_per_epoch = len(train_loader)
-total_steps = steps_per_epoch * EPOCHS
+# Scheduler
+total_steps = len(train_loader) * EPOCHS // ACC_STEPS
 warmup_steps = int(WARMUP_RATIO * total_steps)
 
 scheduler = get_linear_schedule_with_warmup(
@@ -363,19 +338,19 @@ for epoch in range(EPOCHS):
     pbar = tqdm(enumerate(train_loader), total=len(train_loader), desc=f"Train epoch {epoch+1}/{EPOCHS}")
     
     for step, batch in pbar:
-        input_ids = batch["input_ids"].to(DEVICE, non_blocking=True)
-        attention_mask = batch["attention_mask"].to(DEVICE, non_blocking=True)
-        labels1 = batch["label_lvl1"].to(DEVICE, non_blocking=True)
-        labels2 = batch["label_lvl2"].to(DEVICE, non_blocking=True)
+        input_ids = batch["input_ids"].to(DEVICE)
+        attention_mask = batch["attention_mask"].to(DEVICE)
+        labels1 = batch["label_lvl1"].to(DEVICE)
+        labels2 = batch["label_lvl2"].to(DEVICE)
         
-        with autocast(device_type='cuda' if DEVICE.type == 'cuda' else 'cpu'):
+        with autocast(device_type=DEVICE.type):
             logits1, logits2 = model(input_ids, attention_mask)
             
             # Combined loss with adaptive weights
             loss1 = criterion_lvl1(logits1, labels1)
             loss2 = criterion_lvl2(logits2, labels2)
             
-            # Dynamic weight adjustment based on epoch
+            # Dynamic weight adjustment
             epoch_factor = min(1.0, (epoch + 1) / 3)
             current_l2_weight = L2_WEIGHT * epoch_factor
             
@@ -402,7 +377,7 @@ for epoch in range(EPOCHS):
     print(f"Epoch {epoch+1} — avg training loss: {avg_loss:.4f}")
     
     # ----------------------------
-    # Enhanced Validation
+    # Validation
     # ----------------------------
     model.eval()
     all_p1, all_l1, all_p2, all_l2 = [], [], [], []
@@ -501,6 +476,13 @@ print("="*60)
 print(f"Level1 — Accuracy: {acc1:.4f} | F1-weighted: {f1w1:.4f}")
 print(f"Level2 — Accuracy: {acc2:.4f} | F1-weighted: {f1w2:.4f}")
 print("="*60)
+
+# Show classification reports for detailed analysis
+print("\nDetailed Level1 Classification Report:")
+print(classification_report(all_l1, all_p1, target_names=le1.classes_, digits=3))
+
+print("\nDetailed Level2 Classification Report:")
+print(classification_report(all_l2, all_p2, target_names=le2.classes_, digits=3))
 
 if acc1 >= 0.90 and acc2 >= 0.80:
     print("🎯 TARGETS ACHIEVED!")

@@ -1,3 +1,6 @@
+!pip install --upgrade pip
+!pip install "transformers==4.44.2" "accelerate>=0.30.0" "torch==2.3.0"
+
 import os
 import random
 import numpy as np
@@ -17,7 +20,7 @@ from tqdm import tqdm
 # Config / hyperparameters
 # ----------------------------
 PRETRAINED_MODEL = "microsoft/deberta-v3-large"  # <-- EDIT #1
-MAX_LEN = 512          # you can increase to 512 if GPU memory allows
+MAX_LEN = 384          # you can increase to 512 if GPU memory allows
 BATCH_SIZE = 8
 EPOCHS = 15
 LR = 2e-5

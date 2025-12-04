@@ -42,7 +42,7 @@ CSV_PATH = "./dataset/MN-DS-news-classification.csv"
 DROPOUTS = [0.05, 0.1, 0.15, 0.2, 0.25, 0.3]
 
 # --------- Gradient accumulation setting ----------
-ACC_STEPS = 4  # effective batch size = BATCH_SIZE * ACC_STEPS
+ACC_STEPS = 2  # effective batch size = BATCH_SIZE * ACC_STEPS
 
 # Hierarchical loss weights (light)
 L1_WEIGHT = 1.2

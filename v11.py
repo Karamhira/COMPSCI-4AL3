@@ -7,7 +7,7 @@ import torch.nn.functional as F
 from torch import nn
 from torch.utils.data import Dataset, DataLoader
 from transformers import AutoTokenizer, AutoModel, get_linear_schedule_with_warmup
-from torch.optim import AdamW, Adam
+from torch.optim import AdamW
 from torch.amp import GradScaler, autocast
 from sklearn.preprocessing import LabelEncoder
 from sklearn.model_selection import train_test_split
@@ -17,30 +17,19 @@ import warnings
 warnings.filterwarnings('ignore')
 
 # ----------------------------
-# Optimized Advanced Config
+# SIMPLIFIED Config (Focus on stability)
 # ----------------------------
 PRETRAINED_MODEL = "roberta-large"
 MAX_LEN = 512
 BATCH_SIZE = 8
-EPOCHS = 20
-LR = 1.5e-5
-BACKBONE_LR = 8e-6
-CLASSIFIER_LR = 3e-4
-WEIGHT_DECAY = 0.02
-WARMUP_RATIO = 0.08
+EPOCHS = 10  # Start with fewer epochs
+LR = 2e-5  # Standard LR
+WEIGHT_DECAY = 0.01
+WARMUP_RATIO = 0.1
 SEED = 42
 GRAD_CLIP = 1.0
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 CSV_PATH = "./dataset/MN-DS-news-classification.csv"
-
-# Disable MixUp for text (it doesn't work with token indices)
-USE_MIXUP = False  # Can't use MixUp with token indices
-USE_CUTMIX = False  # Can't use CutMix with text
-USE_LABEL_SMOOTHING = True
-SMOOTHING = 0.15
-USE_FOCAL_LOSS = True
-FOCAL_GAMMA = 2.0
-FOCAL_ALPHA = 0.25
 
 # ----------------------------
 # Seeds
@@ -54,69 +43,21 @@ if DEVICE.type == "cuda":
     torch.backends.cudnn.benchmark = False
 
 # ----------------------------
-# Advanced Loss Functions
+# SIMPLE Dataset (No augmentation for now)
 # ----------------------------
-class FocalLoss(nn.Module):
-    def __init__(self, alpha=0.25, gamma=2.0, reduction='mean'):
-        super().__init__()
-        self.alpha = alpha
-        self.gamma = gamma
-        self.reduction = reduction
-        
-    def forward(self, inputs, targets):
-        ce_loss = F.cross_entropy(inputs, targets, reduction='none')
-        pt = torch.exp(-ce_loss)
-        focal_loss = self.alpha * (1 - pt) ** self.gamma * ce_loss
-        
-        if self.reduction == 'mean':
-            return focal_loss.mean()
-        elif self.reduction == 'sum':
-            return focal_loss.sum()
-        return focal_loss
-
-# ----------------------------
-# Dataset with Advanced Augmentation
-# ----------------------------
-class AdvancedNewsDataset(Dataset):
-    def __init__(self, texts, labels_lvl1, labels_lvl2, tokenizer, max_len=MAX_LEN, augment=False):
+class NewsDataset(Dataset):
+    def __init__(self, texts, labels_lvl1, labels_lvl2, tokenizer, max_len=MAX_LEN):
         self.texts = texts
         self.labels_lvl1 = labels_lvl1
         self.labels_lvl2 = labels_lvl2
         self.tokenizer = tokenizer
         self.max_len = max_len
-        self.augment = augment
         
     def __len__(self):
         return len(self.texts)
     
-    def apply_augmentation(self, text):
-        """Advanced text augmentation"""
-        words = text.split()
-        if len(words) < 5:
-            return text
-            
-        if self.augment:
-            # Random swap
-            if random.random() < 0.3 and len(words) > 2:
-                idx1, idx2 = random.sample(range(len(words)), 2)
-                words[idx1], words[idx2] = words[idx2], words[idx1]
-            
-            # Random deletion
-            if random.random() < 0.1 and len(words) > 3:
-                idx = random.randint(0, len(words)-1)
-                words.pop(idx)
-            
-            # Random insertion (duplicate)
-            if random.random() < 0.1:
-                idx = random.randint(0, len(words)-1)
-                words.insert(idx, words[idx])
-        
-        return ' '.join(words)
-    
     def __getitem__(self, idx):
         text = str(self.texts[idx])
-        if self.augment:
-            text = self.apply_augmentation(text)
         
         encoded = self.tokenizer(
             text,
@@ -135,92 +76,41 @@ class AdvancedNewsDataset(Dataset):
         }
 
 # ----------------------------
-# Advanced Pooling Methods (Simplified)
+# SIMPLE Model (Independent classifiers)
 # ----------------------------
-class AttentionPooling(nn.Module):
-    """Simplified attention pooling"""
-    def __init__(self, hidden_size):
-        super().__init__()
-        self.att = nn.Linear(hidden_size, 1)
-        self.norm = nn.LayerNorm(hidden_size)
-        
-    def forward(self, hidden_states, mask):
-        scores = self.att(hidden_states).squeeze(-1)
-        scores = scores.masked_fill(mask == 0, -1e4)
-        weights = F.softmax(scores, dim=1)
-        pooled = torch.sum(hidden_states * weights.unsqueeze(-1), dim=1)
-        return self.norm(pooled)
-
-class MeanPooling(nn.Module):
-    """Mean pooling"""
-    def forward(self, hidden_states, mask):
-        mask_expanded = mask.unsqueeze(-1).float()
-        sum_embeddings = torch.sum(hidden_states * mask_expanded, 1)
-        sum_mask = mask_expanded.sum(1).clamp(min=1e-9)
-        return sum_embeddings / sum_mask
-
-# ----------------------------
-# Optimized Advanced Model
-# ----------------------------
-class OptimizedHierarchicalRoberta(nn.Module):
+class SimpleHierarchicalRoberta(nn.Module):
     def __init__(self, num_labels_lvl1, num_labels_lvl2, pretrained_model=PRETRAINED_MODEL):
         super().__init__()
         self.roberta = AutoModel.from_pretrained(pretrained_model)
         hidden_size = self.roberta.config.hidden_size
         
-        # Dual pooling
-        self.att_pooling = AttentionPooling(hidden_size)
-        self.mean_pooling = MeanPooling()
-        
-        # Feature fusion
-        self.fusion = nn.Sequential(
-            nn.Linear(hidden_size * 2, hidden_size),
-            nn.GELU(),
+        # Simple mean pooling
+        self.pooling = nn.Sequential(
             nn.Dropout(0.3),
+            nn.Linear(hidden_size, hidden_size),
+            nn.Tanh(),
             nn.LayerNorm(hidden_size)
         )
         
-        # Level1 classifier
-        self.classifier_lvl1 = nn.Sequential(
-            nn.Linear(hidden_size, 256),
-            nn.GELU(),
-            nn.Dropout(0.3),
-            nn.Linear(256, num_labels_lvl1)
-        )
-        
-        # Level2 classifier with Level1 guidance
-        self.classifier_lvl2 = nn.Sequential(
-            nn.Linear(hidden_size + num_labels_lvl1, 512),
-            nn.GELU(),
-            nn.Dropout(0.4),
-            nn.Linear(512, 256),
-            nn.GELU(),
-            nn.Dropout(0.3),
-            nn.Linear(256, num_labels_lvl2)
-        )
-        
-        # Learnable gate for hierarchical connection
-        self.gate_weight = nn.Parameter(torch.tensor(0.5))
+        # Independent classifiers
+        self.classifier_lvl1 = nn.Linear(hidden_size, num_labels_lvl1)
+        self.classifier_lvl2 = nn.Linear(hidden_size, num_labels_lvl2)
         
     def forward(self, input_ids, attention_mask):
         outputs = self.roberta(input_ids=input_ids, attention_mask=attention_mask)
-        hidden_states = outputs.last_hidden_state
         
-        # Dual pooling
-        att_pooled = self.att_pooling(hidden_states, attention_mask)
-        mean_pooled = self.mean_pooling(hidden_states, attention_mask)
+        # Mean pooling
+        mask_expanded = attention_mask.unsqueeze(-1).float()
+        sum_embeddings = torch.sum(outputs.last_hidden_state * mask_expanded, 1)
+        sum_mask = mask_expanded.sum(1).clamp(min=1e-9)
+        pooled = sum_embeddings / sum_mask
         
-        # Fuse
-        pooled = torch.cat([att_pooled, mean_pooled], dim=-1)
-        fused = self.fusion(pooled)
+        # Apply pooling layer
+        pooled = self.pooling(pooled)
         
-        # Level1 predictions
-        logits1 = self.classifier_lvl1(fused)
-        
-        # Level2 with hierarchical information
-        lvl1_probs = F.softmax(logits1, dim=-1)
-        lvl2_input = torch.cat([fused, lvl1_probs], dim=-1)
-        logits2 = self.classifier_lvl2(lvl2_input)
+        # Separate predictions
+        logits1 = self.classifier_lvl1(pooled)
+        logits2 = self.classifier_lvl2(pooled)
         
         return logits1, logits2
 
@@ -250,71 +140,44 @@ print(f"Training samples: {len(X_train)}, Validation samples: {len(X_val)}")
 # Create datasets
 # ----------------------------
 tokenizer = AutoTokenizer.from_pretrained(PRETRAINED_MODEL)
-train_ds = AdvancedNewsDataset(X_train.tolist(), y1_train.tolist(), y2_train.tolist(), tokenizer, augment=True)
-val_ds = AdvancedNewsDataset(X_val.tolist(), y1_val.tolist(), y2_val.tolist(), tokenizer, augment=False)
+train_ds = NewsDataset(X_train.tolist(), y1_train.tolist(), y2_train.tolist(), tokenizer)
+val_ds = NewsDataset(X_val.tolist(), y1_val.tolist(), y2_val.tolist(), tokenizer)
 
 train_loader = DataLoader(train_ds, batch_size=BATCH_SIZE, shuffle=True, pin_memory=True)
 val_loader = DataLoader(val_ds, batch_size=BATCH_SIZE, shuffle=False, pin_memory=True)
 
 # ----------------------------
-# Class weights & loss functions
+# Class weights (IMPORTANT for Level2)
 # ----------------------------
-print("Computing class weights...")
-counts_lvl1 = np.bincount(y1_train)
+print("Computing class weights for Level2...")
 counts_lvl2 = np.bincount(y2_train)
 
-# Focal loss for Level2
-if USE_FOCAL_LOSS:
-    criterion_lvl2 = FocalLoss(alpha=FOCAL_ALPHA, gamma=FOCAL_GAMMA)
-else:
-    criterion_lvl2 = nn.CrossEntropyLoss(label_smoothing=SMOOTHING if USE_LABEL_SMOOTHING else 0.0)
+# Calculate balanced class weights
+weight_lvl2 = torch.tensor(1.0 / (counts_lvl2 + 1e-6), dtype=torch.float32)
+weight_lvl2 = weight_lvl2 / weight_lvl2.sum() * len(weight_lvl2)  # Normalize
+weight_lvl2 = weight_lvl2.to(DEVICE)
 
-criterion_lvl1 = nn.CrossEntropyLoss(label_smoothing=SMOOTHING if USE_LABEL_SMOOTHING else 0.0)
+print(f"Level2 class weights range: {weight_lvl2.min():.2f} to {weight_lvl2.max():.2f}")
+
+# Loss functions with class weights for Level2
+criterion_lvl1 = nn.CrossEntropyLoss(label_smoothing=0.1)
+criterion_lvl2 = nn.CrossEntropyLoss(weight=weight_lvl2, label_smoothing=0.1)
 
 # ----------------------------
 # Model, optimizer, scheduler
 # ----------------------------
-print("Initializing optimized model...")
-model = OptimizedHierarchicalRoberta(
+print("Initializing simple model...")
+model = SimpleHierarchicalRoberta(
     num_labels_lvl1=len(le1.classes_),
     num_labels_lvl2=len(le2.classes_)
 ).to(DEVICE)
 
 print(f"Model parameters: {sum(p.numel() for p in model.parameters()):,}")
 
-# Optimizer with layer-wise decay
-param_optimizer = list(model.named_parameters())
-no_decay = ['bias', 'LayerNorm.weight']
-optimizer_grouped_parameters = [
-    {
-        'params': [p for n, p in param_optimizer 
-                  if 'roberta' in n and not any(nd in n for nd in no_decay)],
-        'lr': BACKBONE_LR,
-        'weight_decay': WEIGHT_DECAY
-    },
-    {
-        'params': [p for n, p in param_optimizer 
-                  if 'roberta' in n and any(nd in n for nd in no_decay)],
-        'lr': BACKBONE_LR,
-        'weight_decay': 0.0
-    },
-    {
-        'params': [p for n, p in param_optimizer 
-                  if 'roberta' not in n and not any(nd in n for nd in no_decay)],
-        'lr': CLASSIFIER_LR,
-        'weight_decay': WEIGHT_DECAY
-    },
-    {
-        'params': [p for n, p in param_optimizer 
-                  if 'roberta' not in n and any(nd in n for nd in no_decay)],
-        'lr': CLASSIFIER_LR,
-        'weight_decay': 0.0
-    },
-]
+# Simple optimizer (all parameters same LR)
+optimizer = AdamW(model.parameters(), lr=LR, weight_decay=WEIGHT_DECAY)
 
-optimizer = AdamW(optimizer_grouped_parameters)
-
-# Linear schedule with warmup
+# Linear schedule
 total_steps = len(train_loader) * EPOCHS
 warmup_steps = int(WARMUP_RATIO * total_steps)
 scheduler = get_linear_schedule_with_warmup(
@@ -326,32 +189,31 @@ scheduler = get_linear_schedule_with_warmup(
 scaler = GradScaler()
 
 # ----------------------------
-# Training with Gradient Accumulation
+# Training
 # ----------------------------
-ACC_STEPS = 4  # Effective batch size = 8 * 4 = 32
-best_acc2 = 0
-patience_counter = 0
-best_model_state = None
-training_history = []
-
 print("\n" + "="*60)
-print("Starting OPTIMIZED training...")
+print("Starting SIMPLE training (debug mode)")
 print("="*60)
+
+# Store predictions for analysis
+all_predictions = []
 
 for epoch in range(EPOCHS):
     model.train()
     total_loss = 0
-    total_loss1 = 0
-    total_loss2 = 0
-    optimizer.zero_grad()
+    total_correct_lvl1 = 0
+    total_correct_lvl2 = 0
+    total_samples = 0
     
-    pbar = tqdm(enumerate(train_loader), total=len(train_loader), desc=f"Train epoch {epoch+1}/{EPOCHS}")
+    pbar = tqdm(train_loader, desc=f"Train epoch {epoch+1}/{EPOCHS}")
     
-    for step, batch in pbar:
+    for batch in pbar:
         input_ids = batch["input_ids"].to(DEVICE)
         attention_mask = batch["attention_mask"].to(DEVICE)
         labels1 = batch["label_lvl1"].to(DEVICE)
         labels2 = batch["label_lvl2"].to(DEVICE)
+        
+        optimizer.zero_grad()
         
         with autocast(device_type=DEVICE.type):
             logits1, logits2 = model(input_ids, attention_mask)
@@ -359,38 +221,37 @@ for epoch in range(EPOCHS):
             loss1 = criterion_lvl1(logits1, labels1)
             loss2 = criterion_lvl2(logits2, labels2)
             
-            # Emphasize Level2 more
-            loss = loss1 + loss2 * 1.3
-            
-            # Scale loss for gradient accumulation
-            loss = loss / ACC_STEPS
+            # Equal weighting
+            loss = loss1 + loss2
         
         scaler.scale(loss).backward()
+        scaler.unscale_(optimizer)
+        torch.nn.utils.clip_grad_norm_(model.parameters(), GRAD_CLIP)
+        scaler.step(optimizer)
+        scaler.update()
+        scheduler.step()
         
-        total_loss += loss.item() * ACC_STEPS
-        total_loss1 += loss1.item()
-        total_loss2 += loss2.item()
+        # Training accuracy
+        preds1 = torch.argmax(logits1, dim=1)
+        preds2 = torch.argmax(logits2, dim=1)
+        total_correct_lvl1 += (preds1 == labels1).sum().item()
+        total_correct_lvl2 += (preds2 == labels2).sum().item()
+        total_samples += labels1.size(0)
         
-        # Gradient accumulation step
-        if (step + 1) % ACC_STEPS == 0 or (step + 1) == len(train_loader):
-            scaler.unscale_(optimizer)
-            torch.nn.utils.clip_grad_norm_(model.parameters(), GRAD_CLIP)
-            scaler.step(optimizer)
-            scaler.update()
-            optimizer.zero_grad()
-            scheduler.step()
+        total_loss += loss.item()
+        
+        train_acc1 = total_correct_lvl1 / total_samples
+        train_acc2 = total_correct_lvl2 / total_samples
         
         pbar.set_postfix({
-            "loss": f"{total_loss/(step+1):.4f}",
-            "loss1": f"{total_loss1/(step+1):.4f}",
-            "loss2": f"{total_loss2/(step+1):.4f}",
+            "loss": f"{total_loss/(pbar.n+1):.4f}",
+            "train_L1": f"{train_acc1:.4f}",
+            "train_L2": f"{train_acc2:.4f}",
             "lr": f"{scheduler.get_last_lr()[0]:.2e}"
         })
     
     avg_loss = total_loss / len(train_loader)
-    avg_loss1 = total_loss1 / len(train_loader)
-    avg_loss2 = total_loss2 / len(train_loader)
-    print(f"Epoch {epoch+1} — Total Loss: {avg_loss:.4f}, L1: {avg_loss1:.4f}, L2: {avg_loss2:.4f}")
+    print(f"Epoch {epoch+1} — Loss: {avg_loss:.4f}, Train L1: {train_acc1:.4f}, Train L2: {train_acc2:.4f}")
     
     # ----------------------------
     # Validation
@@ -399,7 +260,7 @@ for epoch in range(EPOCHS):
     all_p1, all_l1, all_p2, all_l2 = [], [], [], []
     
     with torch.no_grad():
-        for batch in tqdm(val_loader, desc="Validation", leave=False):
+        for batch in val_loader:
             input_ids = batch["input_ids"].to(DEVICE)
             attention_mask = batch["attention_mask"].to(DEVICE)
             
@@ -411,6 +272,14 @@ for epoch in range(EPOCHS):
             all_l1.extend(batch["label_lvl1"].numpy())
             all_p2.extend(preds2)
             all_l2.extend(batch["label_lvl2"].numpy())
+    
+    # Store for analysis
+    if epoch == 0:
+        all_predictions.append({
+            'epoch': epoch + 1,
+            'preds_lvl2': all_p2[:100],  # Store first 100 predictions
+            'true_lvl2': all_l2[:100]
+        })
     
     # Compute metrics
     acc1 = accuracy_score(all_l1, all_p1)
@@ -425,150 +294,89 @@ for epoch in range(EPOCHS):
     print(f"Level2 — Acc: {acc2:.4f} | F1-w: {f1w2:.4f}")
     print("="*50 + "\n")
     
-    # Save training history
-    training_history.append({
-        'epoch': epoch + 1,
-        'train_loss': avg_loss,
-        'train_loss1': avg_loss1,
-        'train_loss2': avg_loss2,
-        'val_acc1': acc1,
-        'val_acc2': acc2,
-        'val_f1w1': f1w1,
-        'val_f1w2': f1w2
-    })
+    # Early stopping check
+    if epoch == 0:
+        expected_lvl2 = 1 / len(le2.classes_)  # Random chance
+        print(f"Expected random Level2 accuracy: {expected_lvl2:.4f} (1/{len(le2.classes_)})")
+        print(f"Actual Level2 accuracy: {acc2:.4f}")
+        
+        if acc2 < expected_lvl2 * 2:  # Less than 2x random chance
+            print("\n⚠️ WARNING: Level2 accuracy is too low!")
+            print("Possible issues:")
+            print("1. Labels might be shuffled")
+            print("2. Class imbalance is severe")
+            print("3. Model isn't learning Level2 features")
+            
+            # Analyze predictions
+            print("\nFirst 10 Level2 predictions:")
+            for i in range(min(10, len(all_p2))):
+                print(f"  True: {le2.classes_[all_l2[i]]} ({all_l2[i]}) | Pred: {le2.classes_[all_p2[i]]} ({all_p2[i]})")
     
-    # Early stopping and model saving
-    if acc2 > best_acc2 + 0.001:  # 0.1% improvement
-        best_acc2 = acc2
-        patience_counter = 0
-        best_model_state = model.state_dict().copy()
-        
-        checkpoint = {
-            'epoch': epoch,
-            'model_state_dict': best_model_state,
-            'optimizer_state_dict': optimizer.state_dict(),
-            'scheduler_state_dict': scheduler.state_dict(),
-            'best_acc2': best_acc2,
-            'acc1': acc1,
-            'acc2': acc2,
-            'le1_classes': le1.classes_,
-            'le2_classes': le2.classes_,
-            'training_history': training_history
-        }
-        torch.save(checkpoint, "best_model_checkpoint.pt")
-        print(f"✓ New best model saved! (Level2 Acc: {acc2:.4f})")
-    else:
-        patience_counter += 1
-        print(f"✗ No improvement for {patience_counter}/5 epochs")
-        
-        if patience_counter >= 5:
-            print(f"\nEarly stopping triggered at epoch {epoch+1}")
-            break
-    
-    # Save periodic checkpoint
-    if (epoch + 1) % 5 == 0:
-        torch.save(model.state_dict(), f"checkpoint_epoch{epoch+1}.pt")
+    # Save model
+    torch.save(model.state_dict(), f"simple_model_epoch{epoch+1}.pt")
 
-# Load best model
-if best_model_state is not None:
-    print("\nLoading best model for final evaluation...")
-    model.load_state_dict(best_model_state)
+# ----------------------------
+# Final Analysis
+# ----------------------------
+print("\n" + "="*70)
+print("TRAINING DIAGNOSTICS")
+print("="*70)
 
-# Final detailed evaluation
-model.eval()
-all_p1, all_l1, all_p2, all_l2 = [], [], [], []
+# Check class distribution
+print("\nLevel2 Class Distribution (Top 20):")
+sorted_indices = np.argsort(counts_lvl2)[::-1]
+for i, idx in enumerate(sorted_indices[:20]):
+    print(f"  {le2.classes_[idx]:30s}: {counts_lvl2[idx]:4d} samples ({counts_lvl2[idx]/len(y2_train):.2%})")
 
-with torch.no_grad():
-    for batch in val_loader:
-        input_ids = batch["input_ids"].to(DEVICE)
-        attention_mask = batch["attention_mask"].to(DEVICE)
-        
-        logits1, logits2 = model(input_ids, attention_mask)
-        preds1 = torch.argmax(logits1, dim=1).cpu().numpy()
-        preds2 = torch.argmax(logits2, dim=1).cpu().numpy()
-        
-        all_p1.extend(preds1)
-        all_l1.extend(batch["label_lvl1"].numpy())
-        all_p2.extend(preds2)
-        all_l2.extend(batch["label_lvl2"].numpy())
+# Check if model is predicting only majority class
+print(f"\nMajority class baseline for Level2: {counts_lvl2.max()/len(y2_train):.4f}")
 
-# Final metrics
-acc1 = accuracy_score(all_l1, all_p1)
-f1w1 = f1_score(all_l1, all_p1, average='weighted')
-acc2 = accuracy_score(all_l2, all_p2)
-f1w2 = f1_score(all_l2, all_p2, average='weighted')
+# Show confusion patterns
+print("\nMost common Level2 predictions:")
+if len(all_p2) > 0:
+    pred_counts = np.bincount(all_p2, minlength=len(le2.classes_))
+    top_pred_indices = np.argsort(pred_counts)[-5:][::-1]
+    for idx in top_pred_indices:
+        if pred_counts[idx] > 0:
+            print(f"  {le2.classes_[idx]:30s}: {pred_counts[idx]:3d} predictions")
 
 print("\n" + "="*70)
-print("FINAL RESULTS")
-print("="*70)
-print(f"Level1 — Accuracy: {acc1:.4f} | F1-weighted: {f1w1:.4f}")
-print(f"Level2 — Accuracy: {acc2:.4f} | F1-weighted: {f1w2:.4f}")
+print("NEXT STEPS BASED ON RESULTS")
 print("="*70)
 
-# Show training progress
-print("\nTraining Progress:")
-for hist in training_history[-5:]:  # Last 5 epochs
-    print(f"Epoch {hist['epoch']}: L1={hist['val_acc1']:.4f}, L2={hist['val_acc2']:.4f}")
-
-# Analyze performance
-if acc1 >= 0.90 and acc2 >= 0.80:
-    print("\n🎯 TARGETS ACHIEVED! Excellent!")
-elif acc1 >= 0.88 and acc2 >= 0.78:
-    print("\n✅ Close to targets! Consider training a bit longer.")
-    print("   Try increasing epochs to 25-30 for further improvement.")
-elif acc1 >= 0.85 and acc2 >= 0.75:
-    print("\n⚠️ Good progress but not at targets yet.")
-    print("   Consider trying these improvements:")
-    print("   1. Increase epochs to 25-30")
-    print("   2. Try 'microsoft/deberta-v3-large' model")
-    print("   3. Add more data augmentation")
+if acc2 < 0.3:
+    print("⚠️ Level2 accuracy < 30% - Serious problem!")
+    print("Try these fixes:")
+    print("1. CHECK LABELS: Make sure Level2 labels are correct")
+    print("2. SIMPLER MODEL: Use roberta-base instead of roberta-large")
+    print("3. BATCH SIZE: Increase to 16 or 32")
+    print("4. LEARNING RATE: Try 3e-5 or 5e-5")
+    print("5. EPOCHS: Train for 20+ epochs")
+elif acc2 < 0.5:
+    print("⚠️ Level2 accuracy 30-50% - Needs improvement")
+    print("Try:")
+    print("1. Add class weights (already done)")
+    print("2. Train longer (20+ epochs)")
+    print("3. Add data augmentation")
+    print("4. Try focal loss instead of weighted CE")
+elif acc2 < 0.7:
+    print("✅ Level2 accuracy 50-70% - Good progress")
+    print("To reach 80%:")
+    print("1. Train for 20-30 epochs")
+    print("2. Add hierarchical connection (carefully)")
+    print("3. Try model ensemble")
+    print("4. Use deberta-v3-large")
 else:
-    print("\n❌ Needs improvement. Try:")
-    print("   1. Switch to 'microsoft/deberta-v3-large'")
-    print("   2. Increase batch size to 16 if memory allows")
-    print("   3. Use 5-fold cross validation")
-    print("   4. Try ensemble of multiple models")
+    print("🎉 Level2 accuracy > 70% - Excellent!")
+    print("Continue training to reach 80%")
 
 # Save final model
-final_checkpoint = {
+final_state = {
     'model_state_dict': model.state_dict(),
     'le1_classes': le1.classes_,
     'le2_classes': le2.classes_,
-    'tokenizer_config': tokenizer.init_kwargs,
-    'metrics': {
-        'acc1': acc1,
-        'f1w1': f1w1,
-        'acc2': acc2,
-        'f1w2': f1w2
-    },
-    'training_history': training_history
+    'class_weights_lvl2': weight_lvl2.cpu().numpy(),
+    'metrics': {'acc1': acc1, 'acc2': acc2, 'f1w1': f1w1, 'f1w2': f1w2}
 }
-torch.save(final_checkpoint, "optimized_final_model.pt")
-print("\nOptimized model saved as 'optimized_final_model.pt'")
-
-# Additional advanced techniques you can try:
-print("\n" + "="*70)
-print("ADVANCED TECHNIQUES TO REACH TARGETS:")
-print("="*70)
-print("1. MODEL ENSEMBLING:")
-print("   - Train 3-5 models with different seeds")
-print("   - Average their predictions")
-print("   - Can gain 1-3% accuracy")
-
-print("\n2. PSEUDO-LABELING:")
-print("   - Use model's high-confidence predictions")
-print("   - Add them back to training data")
-print("   - Retrain with enlarged dataset")
-
-print("\n3. MODEL SWITCHING:")
-print("   - Try 'microsoft/deberta-v3-large'")
-print("   - Often outperforms RoBERTa on classification")
-
-print("\n4. K-FOLD CROSS VALIDATION:")
-print("   - Train on 5 different splits")
-print("   - Ensemble all 5 models")
-
-print("\n5. TEST TIME AUGMENTATION:")
-print("   - Make predictions on multiple augmentations")
-print("   - Average the predictions")
-print("="*70)
+torch.save(final_state, "simple_final_model.pt")
+print(f"\nModel saved as 'simple_final_model.pt'")

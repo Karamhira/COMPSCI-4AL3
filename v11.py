@@ -1,9 +1,9 @@
+# updated_hier_roberta_multidrop.py
 import os
 import random
 import numpy as np
 import pandas as pd
 import torch
-import torch.nn.functional as F
 from torch import nn
 from torch.utils.data import Dataset, DataLoader
 from transformers import AutoTokenizer, AutoModel, get_linear_schedule_with_warmup
@@ -14,36 +14,42 @@ from sklearn.model_selection import train_test_split
 from sklearn.metrics import accuracy_score, f1_score
 from tqdm import tqdm
 
+# Optional Lookahead optimizer (try import, otherwise fall back)
+try:
+    from torch_optimizer import Lookahead
+    HAVE_LOOKAHEAD = True
+except Exception:
+    HAVE_LOOKAHEAD = False
+
 # ----------------------------
-# OPTIMIZED Config for 90%/80% targets
+# Config / hyperparameters
 # ----------------------------
 PRETRAINED_MODEL = "roberta-large"
 MAX_LEN = 512
 BATCH_SIZE = 8
-EPOCHS = 12
+EPOCHS = 16         # increased default (you can reduce)
 LR = 2e-5
-BACKBONE_LR = 1e-5
-CLASSIFIER_LR = 3e-5
+BACKBONE_LR = 5e-6
+CLASSIFIER_LR = 2e-5
 WEIGHT_DECAY = 0.01
-WARMUP_RATIO = 0.06
+WARMUP_RATIO = 0.06   # smaller warmup for longer training
 SEED = 42
 GRAD_CLIP = 1.0
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 CSV_PATH = "./dataset/MN-DS-news-classification.csv"
 
-# Dropout settings
-DROPOUTS = [0.15, 0.2, 0.25, 0.3, 0.35]
+# Safer dropout ensemble (expanded)
+DROPOUTS = [0.05, 0.1, 0.15, 0.2, 0.25, 0.3, 0.4]
 
-# Gradient accumulation
-ACC_STEPS = 4
+# --------- Gradient accumulation setting ----------
+ACC_STEPS = 4  # effective batch size = BATCH_SIZE * ACC_STEPS
 
-# Loss weights
-L1_WEIGHT = 1.0
-L2_WEIGHT = 1.5
+# Hierarchical loss weights (light)
+L1_WEIGHT = 1.2
+L2_WEIGHT = 1.0
 
-# Early stopping
-PATIENCE = 4
-MIN_DELTA = 0.001
+# R-Drop weight
+R_DROP_WEIGHT = 0.5
 
 # ----------------------------
 # Seeds
@@ -55,46 +61,30 @@ if DEVICE.type == "cuda":
     torch.cuda.manual_seed_all(SEED)
 
 # ----------------------------
-# Focal Loss for Level2
+# Utilities (mean_pool kept for reference)
 # ----------------------------
-class FocalLoss(nn.Module):
-    def __init__(self, alpha=0.25, gamma=2.0):
-        super(FocalLoss, self).__init__()
-        self.alpha = alpha
-        self.gamma = gamma
-        
-    def forward(self, inputs, targets):
-        ce_loss = F.cross_entropy(inputs, targets, reduction='none')
-        pt = torch.exp(-ce_loss)
-        focal_loss = self.alpha * (1-pt)**self.gamma * ce_loss
-        return focal_loss.mean()
+def mean_pool(hidden_states, mask):
+    mask = mask.unsqueeze(-1).float()
+    summed = (hidden_states * mask).sum(dim=1)
+    counts = mask.sum(dim=1).clamp(min=1e-9)
+    return summed / counts
 
 # ----------------------------
 # Dataset
 # ----------------------------
-class EnhancedNewsDataset(Dataset):
-    def __init__(self, texts, labels_lvl1, labels_lvl2, tokenizer, max_len=MAX_LEN, augment=False):
+class NewsDataset(Dataset):
+    def __init__(self, texts, labels_lvl1, labels_lvl2, tokenizer, max_len=MAX_LEN):
         self.texts = texts
         self.labels_lvl1 = labels_lvl1
         self.labels_lvl2 = labels_lvl2
         self.tokenizer = tokenizer
         self.max_len = max_len
-        self.augment = augment
-        
+
     def __len__(self):
         return len(self.texts)
-    
+
     def __getitem__(self, idx):
         text = str(self.texts[idx])
-        
-        # Simple augmentation
-        if self.augment and random.random() < 0.3:
-            words = text.split()
-            if len(words) > 5:
-                i, j = random.sample(range(len(words)), 2)
-                words[i], words[j] = words[j], words[i]
-                text = ' '.join(words)
-        
         encoded = self.tokenizer(
             text,
             padding='max_length',
@@ -112,89 +102,75 @@ class EnhancedNewsDataset(Dataset):
         }
 
 # ----------------------------
-# Enhanced Model (FIXED for FP16)
+# Attention pooling (lightweight)
 # ----------------------------
-class EnhancedHierarchicalRoberta(nn.Module):
-    def __init__(self, num_labels_lvl1, num_labels_lvl2, pretrained_model=PRETRAINED_MODEL, dropouts=DROPOUTS):
+class AttentionPooling(nn.Module):
+    def __init__(self, hidden_size):
+        super().__init__()
+        self.att = nn.Linear(hidden_size, 1)
+
+    def forward(self, hidden_states, mask):
+        # hidden_states: (batch, seq_len, hidden)
+        # mask: (batch, seq_len) -- 1 for real tokens, 0 for padding
+        scores = self.att(hidden_states).squeeze(-1)           # (batch, seq_len)
+        scores = scores.masked_fill(mask == 0, -1e9)          # mask padding
+        weights = torch.softmax(scores, dim=1)                # (batch, seq_len)
+        pooled = torch.sum(hidden_states * weights.unsqueeze(-1), dim=1)  # (batch, hidden)
+        return pooled
+
+# ----------------------------
+# Model with hierarchical gating matrix + R-Drop support
+# ----------------------------
+class HierarchicalRobertaMultiDropout(nn.Module):
+    def __init__(self, num_labels_lvl1, num_labels_lvl2, hierarchy_prior=None,
+                 pretrained_model=PRETRAINED_MODEL, dropouts=DROPOUTS, alpha=0.5):
+        """
+        hierarchy_prior: numpy array shape (num_lvl1, num_lvl2) expressing P(lvl2 | lvl1) or 0/1 mapping.
+        We'll register it as a buffer and normalize rows for a prior.
+        """
         super().__init__()
         self.roberta = AutoModel.from_pretrained(pretrained_model)
         hidden_size = self.roberta.config.hidden_size
 
-        # Attention pooling - FIXED: use -1e4 instead of -1e9 for FP16 safety
-        self.att_pool = nn.Sequential(
-            nn.Linear(hidden_size, hidden_size),
-            nn.Tanh(),
-            nn.Linear(hidden_size, 1)
-        )
-        
-        # Combine attention + CLS
-        self.pool_proj = nn.Linear(hidden_size * 2, hidden_size)
-        
+        # attention pooling
+        self.att_pool = AttentionPooling(hidden_size)
+
         self.dropouts = nn.ModuleList([nn.Dropout(p) for p in dropouts])
-        
-        # Level1 classifier
-        self.classifier_lvl1 = nn.Sequential(
-            nn.Linear(hidden_size, 256),
-            nn.GELU(),
-            nn.Dropout(0.3),
-            nn.Linear(256, num_labels_lvl1)
-        )
-        
-        # Level2 classifier
-        self.classifier_lvl2 = nn.Sequential(
-            nn.Linear(hidden_size, 512),
-            nn.GELU(),
-            nn.Dropout(0.4),
-            nn.Linear(512, 256),
-            nn.GELU(),
-            nn.Dropout(0.3),
-            nn.Linear(256, num_labels_lvl2)
-        )
-        
-        # Hierarchical connection
-        self.proj_lvl1_to_lvl2 = nn.Sequential(
-            nn.Linear(num_labels_lvl1, 128),
-            nn.ReLU(),
-            nn.Linear(128, num_labels_lvl2)
-        )
-        self.alpha = nn.Parameter(torch.tensor(0.3))
-        
+        self.classifier_lvl1 = nn.Linear(hidden_size, num_labels_lvl1)
+        self.classifier_lvl2 = nn.Linear(hidden_size, num_labels_lvl2)
+
+        # gating: dataset-derived prior matrix
+        if hierarchy_prior is None:
+            # fallback: learn a linear projection if no prior provided
+            self.register_buffer("hierarchy_prior", torch.zeros(num_labels_lvl1, num_labels_lvl2))
+        else:
+            # make sure normalized by row
+            prior = np.array(hierarchy_prior, dtype=np.float32)
+            # avoid zero rows; add tiny epsilon
+            row_sums = prior.sum(axis=1, keepdims=True) + 1e-9
+            normalized = prior / row_sums
+            self.register_buffer("hierarchy_prior", torch.tensor(normalized, dtype=torch.float32))
+
+        self.alpha = alpha  # gating weight
+
     def forward(self, input_ids, attention_mask):
         outputs = self.roberta(input_ids=input_ids, attention_mask=attention_mask)
-        hidden_states = outputs.last_hidden_state
-        
-        # Attention pooling with FP16-safe masking
-        scores = self.att_pool(hidden_states).squeeze(-1)
-        # FIX: Use -1e4 instead of -1e9 for FP16 compatibility
-        scores = scores.masked_fill(attention_mask == 0, -1e4)
-        weights = F.softmax(scores, dim=1)
-        att_pooled = torch.sum(hidden_states * weights.unsqueeze(-1), dim=1)
-        
-        # CLS token
-        cls_pooled = hidden_states[:, 0, :]
-        
-        # Combine
-        combined = torch.cat([att_pooled, cls_pooled], dim=-1)
-        pooled = self.pool_proj(combined)
-        
+        pooled = self.att_pool(outputs.last_hidden_state, attention_mask)  # (batch, hidden)
+
         logits1_all, logits2_all = [], []
 
         for dropout in self.dropouts:
             dropped = dropout(pooled)
-            
-            # Level1
-            logits1 = self.classifier_lvl1(dropped)
-            
-            # Level2 with gate
-            logits2_base = self.classifier_lvl2(dropped)
-            
-            # Use soft probabilities
-            lvl1_probs = F.softmax(logits1, dim=-1)
-            gate_signal = torch.sigmoid(self.proj_lvl1_to_lvl2(lvl1_probs))
-            
-            # Additive gate
-            logits2 = logits2_base + self.alpha * gate_signal
-            
+            logits1 = self.classifier_lvl1(dropped)  # (batch, num_lvl1)
+            logits2 = self.classifier_lvl2(dropped)  # (batch, num_lvl2)
+
+            # compute soft gating using logits1 -> softmax -> prior multiplication
+            gate = torch.softmax(logits1, dim=1)   # (batch, num_lvl1)
+            # hierarchy_prior: (num_lvl1, num_lvl2) -> gate @ prior => (batch, num_lvl2)
+            if self.hierarchy_prior.numel() > 0:
+                prior = gate @ self.hierarchy_prior  # (batch, num_lvl2)
+                logits2 = logits2 + self.alpha * prior
+
             logits1_all.append(logits1)
             logits2_all.append(logits2)
 
@@ -205,7 +181,6 @@ class EnhancedHierarchicalRoberta(nn.Module):
 # ----------------------------
 # Load + preprocess data
 # ----------------------------
-print("Loading and preprocessing data...")
 df = pd.read_csv(CSV_PATH)
 df["text_full"] = df["title"].fillna("") + " " + df["content"].fillna("")
 
@@ -214,316 +189,217 @@ df["label_lvl1"] = le1.fit_transform(df["category_level_1"])
 le2 = LabelEncoder()
 df["label_lvl2"] = le2.fit_transform(df["category_level_2"])
 
-print(f"Level1 classes: {len(le1.classes_)}")
-print(f"Level2 classes: {len(le2.classes_)}")
+# Build hierarchy prior matrix P(lvl2 | lvl1)
+num_lvl1 = len(le1.classes_)
+num_lvl2 = len(le2.classes_)
+hierarchy = np.zeros((num_lvl1, num_lvl2), dtype=np.float32)
+for _, row in df.iterrows():
+    i = int(row["label_lvl1"])
+    j = int(row["label_lvl2"])
+    hierarchy[i, j] = 1.0
+# normalize rows later inside model init (we pass raw matrix)
 
+# split (stratify by level1 to keep balanced)
 X_train, X_val, y1_train, y1_val, y2_train, y2_val = train_test_split(
     df["text_full"], df["label_lvl1"], df["label_lvl2"],
     test_size=0.2, random_state=SEED, stratify=df["label_lvl1"]
 )
 
-print(f"Training samples: {len(X_train)}, Validation samples: {len(X_val)}")
-
-# ----------------------------
-# Create datasets
-# ----------------------------
 tokenizer = AutoTokenizer.from_pretrained(PRETRAINED_MODEL)
-train_ds = EnhancedNewsDataset(X_train.tolist(), y1_train.tolist(), y2_train.tolist(), tokenizer, augment=True)
-val_ds = EnhancedNewsDataset(X_val.tolist(), y1_val.tolist(), y2_val.tolist(), tokenizer, augment=False)
-
-train_loader = DataLoader(train_ds, batch_size=BATCH_SIZE, shuffle=True, pin_memory=True)
-val_loader = DataLoader(val_ds, batch_size=BATCH_SIZE, shuffle=False, pin_memory=True)
+train_ds = NewsDataset(X_train.tolist(), y1_train.tolist(), y2_train.tolist(), tokenizer)
+val_ds = NewsDataset(X_val.tolist(), y1_val.tolist(), y2_val.tolist(), tokenizer)
+train_loader = DataLoader(train_ds, batch_size=BATCH_SIZE, shuffle=True, drop_last=False)
+val_loader = DataLoader(val_ds, batch_size=BATCH_SIZE, shuffle=False)
 
 # ----------------------------
-# Class weights & loss
+# Class weights & loss (with label smoothing)
 # ----------------------------
-print("Computing class weights...")
 counts_lvl1 = np.bincount(y1_train)
 counts_lvl2 = np.bincount(y2_train)
+weight_lvl1 = torch.tensor(1.0 / (counts_lvl1 + 1e-6), dtype=torch.float).to(DEVICE)
+weight_lvl2 = torch.tensor(1.0 / (counts_lvl2 + 1e-6), dtype=torch.float).to(DEVICE)
 
-# Normalized class weights
-weight_lvl1 = torch.tensor(len(counts_lvl1) / (counts_lvl1 + 1), dtype=torch.float).to(DEVICE)
-weight_lvl2 = torch.tensor(len(counts_lvl2) / (counts_lvl2 + 1), dtype=torch.float).to(DEVICE)
-
-weight_lvl1 = weight_lvl1 / weight_lvl1.mean()
-weight_lvl2 = weight_lvl2 / weight_lvl2.mean()
-
-print(f"Level1 weight range: {weight_lvl1.min():.2f} - {weight_lvl1.max():.2f}")
-print(f"Level2 weight range: {weight_lvl2.min():.2f} - {weight_lvl2.max():.2f}")
-
-# Loss functions
-criterion_lvl1 = nn.CrossEntropyLoss(weight=weight_lvl1, label_smoothing=0.15)
-criterion_lvl2 = FocalLoss(alpha=0.25, gamma=2.0)
+criterion_lvl1 = nn.CrossEntropyLoss(weight=weight_lvl1, label_smoothing=0.1)
+criterion_lvl2 = nn.CrossEntropyLoss(weight=weight_lvl2, label_smoothing=0.1)
+kl_div_loss = nn.KLDivLoss(reduction="batchmean")  # for R-Drop (expects log-probs vs probs)
 
 # ----------------------------
-# Model, optimizer, scheduler
+# Model, optimizer, scheduler, scaler
 # ----------------------------
-print("Initializing enhanced model...")
-model = EnhancedHierarchicalRoberta(
-    num_labels_lvl1=len(le1.classes_),
-    num_labels_lvl2=len(le2.classes_)
+model = HierarchicalRobertaMultiDropout(
+    num_labels_lvl1=num_lvl1,
+    num_labels_lvl2=num_lvl2,
+    hierarchy_prior=hierarchy,
+    pretrained_model=PRETRAINED_MODEL,
+    dropouts=DROPOUTS,
+    alpha=0.5
 ).to(DEVICE)
 
-print(f"Model parameters: {sum(p.numel() for p in model.parameters()):,}")
+# ---------- Layer-wise LR decay helper ----------
+def get_llrd_params(model, base_lr=BACKBONE_LR, head_lr=CLASSIFIER_LR, decay=0.8):
+    """
+    Create parameter groups where lower layers get smaller lr; embeddings smallest.
+    decay: multiplicative factor per layer from top->bottom (0.8 typical)
+    """
+    opt_params = []
 
-# Optimizer
-param_optimizer = list(model.named_parameters())
-no_decay = ['bias', 'LayerNorm.weight']
-optimizer_grouped_parameters = [
-    {
-        'params': [p for n, p in param_optimizer 
-                  if 'roberta' in n and not any(nd in n for nd in no_decay)],
-        'lr': BACKBONE_LR,
-        'weight_decay': WEIGHT_DECAY
-    },
-    {
-        'params': [p for n, p in param_optimizer 
-                  if 'roberta' in n and any(nd in n for nd in no_decay)],
-        'lr': BACKBONE_LR,
-        'weight_decay': 0.0
-    },
-    {
-        'params': [p for n, p in param_optimizer 
-                  if 'roberta' not in n and not any(nd in n for nd in no_decay)],
-        'lr': CLASSIFIER_LR,
-        'weight_decay': WEIGHT_DECAY
-    },
-    {
-        'params': [p for n, p in param_optimizer 
-                  if 'roberta' not in n and any(nd in n for nd in no_decay)],
-        'lr': CLASSIFIER_LR,
-        'weight_decay': 0.0
-    },
-]
+    # embeddings
+    try:
+        embeddings_params = list(model.roberta.embeddings.parameters())
+        opt_params.append({"params": embeddings_params, "lr": base_lr * (decay ** 24)})
+    except Exception:
+        # fallback
+        pass
 
-optimizer = AdamW(optimizer_grouped_parameters)
+    # encoder layers
+    num_layers = model.roberta.config.num_hidden_layers
+    for i in range(num_layers):
+        layer = model.roberta.encoder.layer[i]
+        # compute lr multiplier: deeper layers (higher i) get higher lr
+        # we want layer 0 (bottom) smallest, layer num_layers-1 largest (closer to base_lr)
+        layer_decay = decay ** (num_layers - 1 - i)
+        lr = base_lr * (layer_decay + 0.0)
+        opt_params.append({"params": layer.parameters(), "lr": lr})
 
-# Scheduler
-total_steps = len(train_loader) * EPOCHS
-warmup_steps = int(WARMUP_RATIO * total_steps)
-scheduler = get_linear_schedule_with_warmup(
-    optimizer,
-    num_warmup_steps=warmup_steps,
-    num_training_steps=total_steps
-)
+    # pooler or final layernorms if any
+    try:
+        pooler_params = list(model.roberta.pooler.parameters())
+        if pooler_params:
+            opt_params.append({"params": pooler_params, "lr": base_lr})
+    except Exception:
+        pass
+
+    # heads
+    opt_params.append({"params": model.classifier_lvl1.parameters(), "lr": head_lr})
+    opt_params.append({"params": model.classifier_lvl2.parameters(), "lr": head_lr})
+
+    return opt_params
+
+optimizer = AdamW(get_llrd_params(model, base_lr=BACKBONE_LR, head_lr=CLASSIFIER_LR), weight_decay=WEIGHT_DECAY)
+
+# Optional Lookahead wrapper
+if HAVE_LOOKAHEAD:
+    optimizer = Lookahead(optimizer, k=5, alpha=0.5)
+
+# total optimizer steps must account for gradient accumulation
+steps_per_epoch = (len(train_loader) + ACC_STEPS - 1) // ACC_STEPS
+total_steps = steps_per_epoch * EPOCHS
+warmup_steps = max(1, int(WARMUP_RATIO * total_steps))
+scheduler = get_linear_schedule_with_warmup(optimizer, num_warmup_steps=warmup_steps, num_training_steps=total_steps)
 
 scaler = GradScaler()
 
 # ----------------------------
-# Training
+# Training + evaluation (with R-Drop)
 # ----------------------------
-best_acc2 = 0
-best_acc1 = 0
-patience_counter = 0
-best_epoch = 0
-best_model_state = None
-
-print("\n" + "="*60)
-print("Starting ENHANCED training for 90%/80% targets")
-print("="*60)
-
 for epoch in range(EPOCHS):
     model.train()
-    total_loss = 0
-    total_loss1 = 0
-    total_loss2 = 0
-    
+    running_loss = 0.0
+    accumulated_steps = 0
+
     pbar = tqdm(enumerate(train_loader), total=len(train_loader), desc=f"Train epoch {epoch+1}/{EPOCHS}")
-    
+    optimizer.zero_grad()
+
     for step, batch in pbar:
         input_ids = batch["input_ids"].to(DEVICE)
         attention_mask = batch["attention_mask"].to(DEVICE)
         labels1 = batch["label_lvl1"].to(DEVICE)
         labels2 = batch["label_lvl2"].to(DEVICE)
-        
-        optimizer.zero_grad()
-        
-        with autocast(device_type=DEVICE.type):
-            logits1, logits2 = model(input_ids, attention_mask)
-            
-            loss1 = criterion_lvl1(logits1, labels1)
-            loss2 = criterion_lvl2(logits2, labels2)
-            
-            # Dynamic weighting
-            epoch_factor = min(1.0, (epoch + 1) / 4)
-            current_l2_weight = L2_WEIGHT * epoch_factor
-            
-            loss = L1_WEIGHT * loss1 + current_l2_weight * loss2
-            loss = loss / ACC_STEPS
-        
+
+        # Two forward passes for R-Drop (stochasticity via dropout) inside autocast
+        with autocast(device_type='cuda' if DEVICE.type == 'cuda' else 'cpu'):
+            logits1_a, logits2_a = model(input_ids, attention_mask)
+            logits1_b, logits2_b = model(input_ids, attention_mask)
+
+            # classification losses (use logits_a for main)
+            loss1 = criterion_lvl1(logits1_a, labels1)
+            loss2 = criterion_lvl2(logits2_a, labels2)
+            cls_loss = L1_WEIGHT * loss1 + L2_WEIGHT * loss2
+
+            # R-Drop KL between a and b for both levels
+            # KL expects input as log-probs and target probs (we average symmetric)
+            logp1_a = torch.log_softmax(logits1_a, dim=1)
+            p1_b = torch.softmax(logits1_b, dim=1)
+            kl1 = kl_div_loss(logp1_a, p1_b)
+
+            logp1_b = torch.log_softmax(logits1_b, dim=1)
+            p1_a = torch.softmax(logits1_a, dim=1)
+            kl1 += kl_div_loss(logp1_b, p1_a)
+            kl1 = 0.5 * kl1
+
+            logp2_a = torch.log_softmax(logits2_a, dim=1)
+            p2_b = torch.softmax(logits2_b, dim=1)
+            kl2 = kl_div_loss(logp2_a, p2_b)
+
+            logp2_b = torch.log_softmax(logits2_b, dim=1)
+            p2_a = torch.softmax(logits2_a, dim=1)
+            kl2 += kl_div_loss(logp2_b, p2_a)
+            kl2 = 0.5 * kl2
+
+            rdrop_loss = (kl1 + kl2)
+
+            raw_loss = cls_loss + R_DROP_WEIGHT * rdrop_loss
+            loss = raw_loss / ACC_STEPS
+
         scaler.scale(loss).backward()
-        
-        total_loss += loss.item() * ACC_STEPS
-        total_loss1 += loss1.item()
-        total_loss2 += loss2.item()
-        
-        # Gradient accumulation
-        if (step + 1) % ACC_STEPS == 0 or (step + 1) == len(train_loader):
+        accumulated_steps += 1
+        running_loss += raw_loss.item()
+
+        # update on accumulation
+        if accumulated_steps % ACC_STEPS == 0:
+            # unscale, clip, step, update scaler, zero_grad, then scheduler.step()
             scaler.unscale_(optimizer)
             torch.nn.utils.clip_grad_norm_(model.parameters(), GRAD_CLIP)
-            scaler.step(optimizer)
+            scaler.step(optimizer)    # optimizer.step() under GradScaler
             scaler.update()
             optimizer.zero_grad()
-            scheduler.step()
-        
-        pbar.set_postfix({
-            "loss": f"{total_loss/(step+1):.4f}",
-            "loss1": f"{total_loss1/(step+1):.4f}",
-            "loss2": f"{total_loss2/(step+1):.4f}",
-            "lr": f"{scheduler.get_last_lr()[0]:.2e}"
-        })
-    
-    avg_loss = total_loss / len(train_loader)
-    avg_loss1 = total_loss1 / len(train_loader)
-    avg_loss2 = total_loss2 / len(train_loader)
-    print(f"Epoch {epoch+1} — Loss: {avg_loss:.4f} (L1: {avg_loss1:.4f}, L2: {avg_loss2:.4f})")
-    
+            scheduler.step()          # <-- CORRECT ORDER: scheduler.step() AFTER optimizer.step()
+
+        pbar.set_postfix({"loss": f"{running_loss / (step + 1):.4f}"})
+
+    # leftover gradients
+    if accumulated_steps % ACC_STEPS != 0:
+        scaler.unscale_(optimizer)
+        torch.nn.utils.clip_grad_norm_(model.parameters(), GRAD_CLIP)
+        scaler.step(optimizer)
+        scaler.update()
+        optimizer.zero_grad()
+        scheduler.step()
+
+    avg_loss = running_loss / len(train_loader)
+    print(f"Epoch {epoch+1} — avg training loss: {avg_loss:.4f}")
+
     # ----------------------------
     # Validation
     # ----------------------------
     model.eval()
     all_p1, all_l1, all_p2, all_l2 = [], [], [], []
-    
     with torch.no_grad():
         for batch in val_loader:
             input_ids = batch["input_ids"].to(DEVICE)
             attention_mask = batch["attention_mask"].to(DEVICE)
-            
+            labels1 = batch["label_lvl1"].to(DEVICE)
+            labels2 = batch["label_lvl2"].to(DEVICE)
+
             logits1, logits2 = model(input_ids, attention_mask)
             preds1 = torch.argmax(logits1, dim=1).cpu().numpy()
             preds2 = torch.argmax(logits2, dim=1).cpu().numpy()
-            
             all_p1.extend(preds1)
-            all_l1.extend(batch["label_lvl1"].numpy())
+            all_l1.extend(labels1.cpu().numpy())
             all_p2.extend(preds2)
-            all_l2.extend(batch["label_lvl2"].numpy())
-    
-    # Compute metrics
+            all_l2.extend(labels2.cpu().numpy())
+
     acc1 = accuracy_score(all_l1, all_p1)
     f1w1 = f1_score(all_l1, all_p1, average='weighted')
+    f1m1 = f1_score(all_l1, all_p1, average='macro')
     acc2 = accuracy_score(all_l2, all_p2)
     f1w2 = f1_score(all_l2, all_p2, average='weighted')
-    
-    print("\n" + "="*50)
-    print(f"Epoch {epoch+1} Validation Results")
-    print("="*50)
-    print(f"Level1 — Acc: {acc1:.4f} | F1-w: {f1w1:.4f}")
-    print(f"Level2 — Acc: {acc2:.4f} | F1-w: {f1w2:.4f}")
-    print("="*50 + "\n")
-    
-    # Early stopping
-    if acc2 > best_acc2 + MIN_DELTA:
-        best_acc2 = acc2
-        best_acc1 = acc1
-        best_epoch = epoch + 1
-        patience_counter = 0
-        best_model_state = model.state_dict().copy()
-        
-        checkpoint = {
-            'epoch': epoch,
-            'model_state_dict': best_model_state,
-            'optimizer_state_dict': optimizer.state_dict(),
-            'scheduler_state_dict': scheduler.state_dict(),
-            'best_acc2': best_acc2,
-            'best_acc1': best_acc1,
-        }
-        torch.save(checkpoint, "best_model_checkpoint.pt")
-        print(f"✓ New best model saved! (Level1: {acc1:.4f}, Level2: {acc2:.4f})")
-    else:
-        patience_counter += 1
-        print(f"✗ No improvement for {patience_counter}/{PATIENCE} epochs")
-        
-        if patience_counter >= PATIENCE:
-            print(f"\nEarly stopping triggered at epoch {epoch+1}")
-            break
-    
+    f1m2 = f1_score(all_l2, all_p2, average='macro')
+    print("** Validation results **")
+    print(f"Level1 — acc: {acc1:.4f}, F1-weighted: {f1w1:.4f}, F1-macro: {f1m1:.4f}")
+    print(f"Level2 — acc: {acc2:.4f}, F1-weighted: {f1w2:.4f}, F1-macro: {f1m2:.4f}")
+
     # Save checkpoint
-    if (epoch + 1) % 3 == 0:
-        torch.save(model.state_dict(), f"checkpoint_epoch{epoch+1}.pt")
+    torch.save(model.state_dict(), f"hier_roberta_multidrop_epoch{epoch+1}.pt")
 
-# Load best model
-if best_model_state is not None:
-    print(f"\nLoading best model from epoch {best_epoch}...")
-    model.load_state_dict(best_model_state)
-
-# Final evaluation
-model.eval()
-all_p1, all_l1, all_p2, all_l2 = [], [], [], []
-
-with torch.no_grad():
-    for batch in val_loader:
-        input_ids = batch["input_ids"].to(DEVICE)
-        attention_mask = batch["attention_mask"].to(DEVICE)
-        
-        logits1, logits2 = model(input_ids, attention_mask)
-        preds1 = torch.argmax(logits1, dim=1).cpu().numpy()
-        preds2 = torch.argmax(logits2, dim=1).cpu().numpy()
-        
-        all_p1.extend(preds1)
-        all_l1.extend(batch["label_lvl1"].numpy())
-        all_p2.extend(preds2)
-        all_l2.extend(batch["label_lvl2"].numpy())
-
-acc1 = accuracy_score(all_l1, all_p1)
-f1w1 = f1_score(all_l1, all_p1, average='weighted')
-acc2 = accuracy_score(all_l2, all_p2)
-f1w2 = f1_score(all_l2, all_p2, average='weighted')
-
-print("\n" + "="*70)
-print("FINAL RESULTS (Best Model)")
-print("="*70)
-print(f"Level1 — Accuracy: {acc1:.4f} | F1-weighted: {f1w1:.4f}")
-print(f"Level2 — Accuracy: {acc2:.4f} | F1-weighted: {f1w2:.4f}")
-print("="*70)
-
-# Assessment
-if acc1 >= 0.90 and acc2 >= 0.80:
-    print("\n🎯 TARGETS ACHIEVED! Excellent work!")
-elif acc1 >= 0.89 and acc2 >= 0.78:
-    print("\n✅ Very close! Try training 2-3 more epochs.")
-elif acc1 >= 0.87 and acc2 >= 0.75:
-    print("\n⚠️ Good progress. Next steps:")
-    print("   1. Try 'microsoft/deberta-v3-large' model")
-    print("   2. Increase epochs to 15-20")
-    print("   3. Add more data augmentation")
-else:
-    print("\n❌ Needs improvement. Try:")
-    print("   1. Switch model to 'roberta-base' (easier to train)")
-    print("   2. Increase batch size to 16")
-    print("   3. Reduce learning rate to 1e-5")
-
-# Save final model
-final_state = {
-    'model_state_dict': model.state_dict(),
-    'le1_classes': le1.classes_,
-    'le2_classes': le2.classes_,
-    'metrics': {'acc1': acc1, 'acc2': acc2, 'f1w1': f1w1, 'f1w2': f1w2}
-}
-torch.save(final_state, "enhanced_final_model.pt")
-print(f"\nEnhanced model saved as 'enhanced_final_model.pt'")
-
-# Quick fixes if not reaching targets
-print("\n" + "="*70)
-print("IF NOT REACHING TARGETS, TRY THESE:")
-print("="*70)
-print("1. DISABLE MIXED PRECISION (if unstable):")
-print("   # Remove 'autocast' and 'GradScaler'")
-print("   # Use full FP32 precision")
-
-print("\n2. SIMPLER MODEL:")
-print("   class SimpleModel(nn.Module):")
-print("       def __init__(...):")
-print("           self.roberta = AutoModel.from_pretrained(...)")
-print("           self.classifier1 = nn.Linear(hidden_size, num_labels1)")
-print("           self.classifier2 = nn.Linear(hidden_size, num_labels2)")
-
-print("\n3. ADJUST LEARNING RATES:")
-print("   LR = 1e-5  # Lower if unstable")
-print("   BACKBONE_LR = 5e-6")
-print("   CLASSIFIER_LR = 2e-5")
-
-print("\n4. MONITOR LOSS TRENDS:")
-print("   - Loss should drop by 30-50% each epoch initially")
-print("   - Should stabilize around epoch 6-8")
-print("   - Level2 loss should be higher than Level1 (normal)")
-print("="*70)
+print("Training complete.")

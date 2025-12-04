@@ -416,7 +416,7 @@ def main(args):
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
-    parser.add_argument("--data_csv", type=str, default=".dataset/mn_ds_data.csv")
+    parser.add_argument("--data_csv", type=str, default="./dataset/mn_ds_data.csv")
     parser.add_argument("--model_name", type=str, default="roberta-base")
     parser.add_argument("--output_dir", type=str, default="./roberta_mnds_model")
     parser.add_argument("--text_col", type=str, default="text")

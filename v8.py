@@ -94,26 +94,30 @@ class HierarchicalRoberta(nn.Module):
         hidden_size = self.roberta.config.hidden_size
         self.dropout_prob = dropout_prob
 
-        # Multiple classifiers for multi-sample dropout
+        # Classifiers
         self.classifier_lvl1 = nn.Linear(hidden_size, num_labels_lvl1)
         self.classifier_lvl2 = nn.Linear(hidden_size, num_labels_lvl2)
         self.dropout = nn.Dropout(dropout_prob)
 
-        self.alpha = 0.5  # Soft-gating weight
+        # Projection for soft-gating
+        self.soft_gate_proj = nn.Linear(num_labels_lvl1, num_labels_lvl2)
+        self.alpha = 0.5
 
     def forward(self, input_ids, attention_mask):
         outputs = self.roberta(input_ids=input_ids, attention_mask=attention_mask)
         pooled = outputs.last_hidden_state[:, 0, :]  # CLS token
 
-        # Multi-sample dropout
         logits1_list, logits2_list = [], []
         for _ in range(NUM_DROPOUT_SAMPLES):
             x = self.dropout(pooled)
             logits1 = self.classifier_lvl1(x)
             logits2 = self.classifier_lvl2(x)
-            # Soft-gating: add Level1 signal to Level2 logits
+
+            # Project Level1 to Level2 size
             soft_gate = torch.softmax(logits1, dim=1)
-            logits2 = logits2 + self.alpha * soft_gate[:, :logits2.size(1)]
+            soft_gate_proj = self.soft_gate_proj(soft_gate)
+            logits2 = logits2 + self.alpha * soft_gate_proj
+
             logits1_list.append(logits1)
             logits2_list.append(logits2)
 

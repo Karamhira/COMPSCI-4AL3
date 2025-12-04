@@ -1,4 +1,3 @@
-
 import os
 import random
 import numpy as np
@@ -17,12 +16,12 @@ from tqdm import tqdm
 # ----------------------------
 # Config / hyperparameters
 # ----------------------------
-PRETRAINED_MODEL = "roberta-large"  # <-- EDIT #1
-MAX_LEN = 512          # you can increase to 512 if GPU memory allows
+PRETRAINED_MODEL = "roberta-large"
+MAX_LEN = 512
 BATCH_SIZE = 8
-EPOCHS = 15
+EPOCHS = 8
 LR = 2e-5
-BACKBONE_LR = 1e-5
+BACKBONE_LR = 5e-6     #
 CLASSIFIER_LR = 2e-5
 WEIGHT_DECAY = 0.01
 WARMUP_RATIO = 0.1
@@ -30,10 +29,16 @@ SEED = 42
 GRAD_CLIP = 1.0
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 CSV_PATH = "./dataset/MN-DS-news-classification.csv"
-DROPOUTS = [0.1, 0.2, 0.3, 0.4, 0.5]
 
-# --------- Gradient accumulation setting (EDIT #3) ----------
-ACC_STEPS = 4  # BATCH_SIZE 8 * 4 = effective 32
+# Safer dropout ensemble (less aggressive than original)
+DROPOUTS = [0.1, 0.15, 0.2, 0.25, 0.3]
+
+# --------- Gradient accumulation setting ----------
+ACC_STEPS = 4  # effective batch size = BATCH_SIZE * ACC_STEPS
+
+# Hierarchical loss weights (light)
+L1_WEIGHT = 1.2
+L2_WEIGHT = 1.0
 
 # ----------------------------
 # Seeds
@@ -45,18 +50,13 @@ if DEVICE.type == "cuda":
     torch.cuda.manual_seed_all(SEED)
 
 # ----------------------------
-# Utilities
+# Utilities (kept mean_pool but we'll use attention pooling)
 # ----------------------------
 def mean_pool(hidden_states, mask):
-    """
-    Average pooling over token dimension, ignoring padding tokens.
-    hidden_states: (batch, seq_len, hidden)
-    mask: (batch, seq_len)
-    """
-    mask = mask.unsqueeze(-1).float()  # (batch, seq_len, 1)
-    summed = (hidden_states * mask).sum(dim=1)  # (batch, hidden)
-    counts = mask.sum(dim=1).clamp(min=1e-9)     # (batch, 1)
-    return summed / counts                      # (batch, hidden)
+    mask = mask.unsqueeze(-1).float()
+    summed = (hidden_states * mask).sum(dim=1)
+    counts = mask.sum(dim=1).clamp(min=1e-9)
+    return summed / counts
 
 # ----------------------------
 # Dataset
@@ -91,6 +91,23 @@ class NewsDataset(Dataset):
         }
 
 # ----------------------------
+# Attention pooling (lightweight)
+# ----------------------------
+class AttentionPooling(nn.Module):
+    def __init__(self, hidden_size):
+        super().__init__()
+        self.att = nn.Linear(hidden_size, 1)
+
+    def forward(self, hidden_states, mask):
+        # hidden_states: (batch, seq_len, hidden)
+        # mask: (batch, seq_len) -- 1 for real tokens, 0 for padding
+        scores = self.att(hidden_states).squeeze(-1)           # (batch, seq_len)
+        scores = scores.masked_fill(mask == 0, -1e9)          # mask padding
+        weights = torch.softmax(scores, dim=1)                # (batch, seq_len)
+        pooled = torch.sum(hidden_states * weights.unsqueeze(-1), dim=1)  # (batch, hidden)
+        return pooled
+
+# ----------------------------
 # Model
 # ----------------------------
 class HierarchicalRobertaMultiDropout(nn.Module):
@@ -98,6 +115,9 @@ class HierarchicalRobertaMultiDropout(nn.Module):
         super().__init__()
         self.roberta = AutoModel.from_pretrained(pretrained_model)
         hidden_size = self.roberta.config.hidden_size
+
+        # attention pooling
+        self.att_pool = AttentionPooling(hidden_size)
 
         self.dropouts = nn.ModuleList([nn.Dropout(p) for p in dropouts])
         self.classifier_lvl1 = nn.Linear(hidden_size, num_labels_lvl1)
@@ -107,8 +127,7 @@ class HierarchicalRobertaMultiDropout(nn.Module):
 
     def forward(self, input_ids, attention_mask):
         outputs = self.roberta(input_ids=input_ids, attention_mask=attention_mask)
-        # EDIT #2: mean pooling instead of CLS token
-        pooled = mean_pool(outputs.last_hidden_state, attention_mask)
+        pooled = self.att_pool(outputs.last_hidden_state, attention_mask)  # attention pooling
 
         logits1_all, logits2_all = [], []
 
@@ -117,7 +136,6 @@ class HierarchicalRobertaMultiDropout(nn.Module):
             logits1 = self.classifier_lvl1(dropped)
             logits2 = self.classifier_lvl2(dropped)
             soft_gate = torch.sigmoid(self.proj_lvl1_to_lvl2(logits1))
-            # ensure logits2 and soft_gate same size
             if soft_gate.size(1) != logits2.size(1):
                 soft_gate = soft_gate[:, :logits2.size(1)]
             logits2 = logits2 + self.alpha * soft_gate
@@ -151,14 +169,16 @@ train_loader = DataLoader(train_ds, batch_size=BATCH_SIZE, shuffle=True, drop_la
 val_loader = DataLoader(val_ds, batch_size=BATCH_SIZE, shuffle=False)
 
 # ----------------------------
-# Class weights
+# Class weights & loss (with label smoothing)
 # ----------------------------
 counts_lvl1 = np.bincount(y1_train)
 counts_lvl2 = np.bincount(y2_train)
 weight_lvl1 = torch.tensor(1.0 / (counts_lvl1 + 1e-6), dtype=torch.float).to(DEVICE)
 weight_lvl2 = torch.tensor(1.0 / (counts_lvl2 + 1e-6), dtype=torch.float).to(DEVICE)
-criterion_lvl1 = nn.CrossEntropyLoss(weight=weight_lvl1)
-criterion_lvl2 = nn.CrossEntropyLoss(weight=weight_lvl2)
+
+# label_smoothing requires PyTorch >= 1.10
+criterion_lvl1 = nn.CrossEntropyLoss(weight=weight_lvl1, label_smoothing=0.1)
+criterion_lvl2 = nn.CrossEntropyLoss(weight=weight_lvl2, label_smoothing=0.1)
 
 # ----------------------------
 # Model, optimizer, scheduler, scaler
@@ -206,14 +226,14 @@ for epoch in range(EPOCHS):
             logits1, logits2 = model(input_ids, attention_mask)
             loss1 = criterion_lvl1(logits1, labels1)
             loss2 = criterion_lvl2(logits2, labels2)
-            raw_loss = loss1 + loss2                      # full loss for logging
-            loss = raw_loss / ACC_STEPS                    # scaled for accumulation
+            # hierarchical weighted loss (light)
+            raw_loss = L1_WEIGHT * loss1 + L2_WEIGHT * loss2
+            loss = raw_loss / ACC_STEPS
 
         scaler.scale(loss).backward()
         accumulated_steps += 1
         running_loss += raw_loss.item()
 
-        # perform optimizer step when we've accumulated ACC_STEPS
         if accumulated_steps % ACC_STEPS == 0:
             scaler.unscale_(optimizer)
             torch.nn.utils.clip_grad_norm_(model.parameters(), GRAD_CLIP)
@@ -222,10 +242,9 @@ for epoch in range(EPOCHS):
             optimizer.zero_grad()
             scheduler.step()
 
-        # update progress bar with a helpful metric
         pbar.set_postfix({"loss": f"{running_loss / (step + 1):.4f}"})
 
-    # If there are leftover gradients after the epoch (when len % ACC_STEPS != 0)
+    # leftover gradients
     if accumulated_steps % ACC_STEPS != 0:
         scaler.unscale_(optimizer)
         torch.nn.utils.clip_grad_norm_(model.parameters(), GRAD_CLIP)

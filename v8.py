@@ -8,7 +8,6 @@ from torch.utils.data import Dataset, DataLoader
 from transformers import AutoTokenizer, AutoModel, get_linear_schedule_with_warmup
 from torch.optim import AdamW
 from torch.amp import GradScaler, autocast
-
 from sklearn.preprocessing import LabelEncoder
 from sklearn.model_selection import train_test_split
 from sklearn.metrics import accuracy_score, f1_score
@@ -17,10 +16,10 @@ from tqdm import tqdm
 # ----------------------------
 # Config / hyperparameters
 # ----------------------------
-PRETRAINED_MODEL = "roberta-base"
-MAX_LEN = 256
+PRETRAINED_MODEL = "roberta-large"
+MAX_LEN = 384
 BATCH_SIZE = 8
-EPOCHS = 8
+EPOCHS = 15
 LR = 2e-5
 BACKBONE_LR = 1e-5
 CLASSIFIER_LR = 2e-5
@@ -99,6 +98,9 @@ class HierarchicalRobertaMultiDropout(nn.Module):
             logits1 = self.classifier_lvl1(dropped)
             logits2 = self.classifier_lvl2(dropped)
             soft_gate = torch.sigmoid(self.proj_lvl1_to_lvl2(logits1))
+            # ensure logits2 and soft_gate same size
+            if soft_gate.size(1) != logits2.size(1):
+                soft_gate = soft_gate[:, :logits2.size(1)]
             logits2 = logits2 + self.alpha * soft_gate
             logits1_all.append(logits1)
             logits2_all.append(logits2)
@@ -114,7 +116,6 @@ class HierarchicalRobertaMultiDropout(nn.Module):
 df = pd.read_csv(CSV_PATH)
 df["text_full"] = df["title"].fillna("") + " " + df["content"].fillna("")
 
-# Encode labels
 le1 = LabelEncoder()
 df["label_lvl1"] = le1.fit_transform(df["category_level_1"])
 le2 = LabelEncoder()
@@ -122,26 +123,22 @@ df["label_lvl2"] = le2.fit_transform(df["category_level_2"])
 
 X_train, X_val, y1_train, y1_val, y2_train, y2_val = train_test_split(
     df["text_full"], df["label_lvl1"], df["label_lvl2"],
-    test_size=0.2,
-    random_state=SEED,
-    stratify=df["label_lvl1"]
+    test_size=0.2, random_state=SEED, stratify=df["label_lvl1"]
 )
 
 tokenizer = AutoTokenizer.from_pretrained(PRETRAINED_MODEL)
 train_ds = NewsDataset(X_train.tolist(), y1_train.tolist(), y2_train.tolist(), tokenizer)
 val_ds = NewsDataset(X_val.tolist(), y1_val.tolist(), y2_val.tolist(), tokenizer)
-
 train_loader = DataLoader(train_ds, batch_size=BATCH_SIZE, shuffle=True)
 val_loader = DataLoader(val_ds, batch_size=BATCH_SIZE, shuffle=False)
 
 # ----------------------------
-# Class weights for imbalance
+# Class weights
 # ----------------------------
 counts_lvl1 = np.bincount(y1_train)
 counts_lvl2 = np.bincount(y2_train)
 weight_lvl1 = torch.tensor(1.0 / (counts_lvl1 + 1e-6), dtype=torch.float).to(DEVICE)
 weight_lvl2 = torch.tensor(1.0 / (counts_lvl2 + 1e-6), dtype=torch.float).to(DEVICE)
-
 criterion_lvl1 = nn.CrossEntropyLoss(weight=weight_lvl1)
 criterion_lvl2 = nn.CrossEntropyLoss(weight=weight_lvl2)
 
@@ -162,10 +159,7 @@ optimizer = AdamW([
 
 total_steps = len(train_loader) * EPOCHS
 warmup_steps = int(WARMUP_RATIO * total_steps)
-scheduler = get_linear_schedule_with_warmup(
-    optimizer, num_warmup_steps=warmup_steps, num_training_steps=total_steps
-)
-
+scheduler = get_linear_schedule_with_warmup(optimizer, num_warmup_steps=warmup_steps, num_training_steps=total_steps)
 scaler = GradScaler()
 
 # ----------------------------
@@ -182,7 +176,7 @@ for epoch in range(EPOCHS):
         labels1 = batch["label_lvl1"].to(DEVICE)
         labels2 = batch["label_lvl2"].to(DEVICE)
 
-        with autocast(device_type='cuda' if DEVICE.type == 'cuda' else 'cpu'):
+        with autocast():
             logits1, logits2 = model(input_ids, attention_mask)
             loss1 = criterion_lvl1(logits1, labels1)
             loss2 = criterion_lvl2(logits2, labels2)
@@ -191,9 +185,9 @@ for epoch in range(EPOCHS):
         scaler.scale(loss).backward()
         scaler.unscale_(optimizer)
         torch.nn.utils.clip_grad_norm_(model.parameters(), GRAD_CLIP)
-        scaler.step(optimizer)
+        scaler.step(optimizer)  # handles optimizer.step()
         scaler.update()
-        scheduler.step()
+        scheduler.step()        # called after optimizer update
 
         running_loss += loss.item()
 

@@ -5,33 +5,34 @@ import pandas as pd
 import torch
 from torch import nn
 from torch.utils.data import Dataset, DataLoader
-from transformers import (
-    AutoTokenizer, AutoModel, get_linear_schedule_with_warmup
-)
+from transformers import AutoTokenizer, AutoModel, get_linear_schedule_with_warmup
 from torch.optim import AdamW
+
 from sklearn.preprocessing import LabelEncoder
 from sklearn.model_selection import train_test_split
 from sklearn.metrics import accuracy_score, f1_score
 from tqdm import tqdm
 
 # ----------------------------
-#  Config / hyperparameters
+# Config / hyperparameters
 # ----------------------------
 PRETRAINED_MODEL = "roberta-base"
 MAX_LEN = 256
 BATCH_SIZE = 8
 EPOCHS = 8
-LR_BACKBONE = 1e-5
-LR_CLASSIFIER = 2e-5
+BACKBONE_LR = 1e-5
+CLASSIFIER_LR = 5e-5
 WEIGHT_DECAY = 0.01
 WARMUP_RATIO = 0.1
 SEED = 42
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 CSV_PATH = "dataset/MN-DS-news-classification.csv"
-GRAD_CLIP = 1.0  # Gradient clipping
+GRAD_CLIP = 1.0
+DROPOUT_SAMPLES = 5  # multi-sample dropout
+ALPHA = 0.5  # soft-gate weight
 
 # ----------------------------
-#  Seed
+# Set seeds
 # ----------------------------
 random.seed(SEED)
 np.random.seed(SEED)
@@ -40,7 +41,7 @@ if DEVICE.type == "cuda":
     torch.cuda.manual_seed_all(SEED)
 
 # ----------------------------
-#  Dataset + DataLoader
+# Dataset
 # ----------------------------
 class NewsDataset(Dataset):
     def __init__(self, texts, labels_lvl1, labels_lvl2, tokenizer, max_len=MAX_LEN):
@@ -72,27 +73,40 @@ class NewsDataset(Dataset):
         }
 
 # ----------------------------
-#  Model
+# Hierarchical Model
 # ----------------------------
 class HierarchicalRoberta(nn.Module):
     def __init__(self, num_labels_lvl1, num_labels_lvl2, pretrained_model=PRETRAINED_MODEL, dropout_prob=0.3):
         super().__init__()
         self.roberta = AutoModel.from_pretrained(pretrained_model)
         hidden_size = self.roberta.config.hidden_size
-        self.dropout = nn.Dropout(dropout_prob)
         self.classifier_lvl1 = nn.Linear(hidden_size, num_labels_lvl1)
         self.classifier_lvl2 = nn.Linear(hidden_size, num_labels_lvl2)
+        self.dropouts = nn.ModuleList([nn.Dropout(dropout_prob) for _ in range(DROPOUT_SAMPLES)])
+        self.alpha = ALPHA
 
     def forward(self, input_ids, attention_mask):
         outputs = self.roberta(input_ids=input_ids, attention_mask=attention_mask)
         pooled = outputs.last_hidden_state[:, 0, :]  # CLS token
-        pooled = self.dropout(pooled)
-        logits1 = self.classifier_lvl1(pooled)
-        logits2 = self.classifier_lvl2(pooled)
+
+        # Multi-sample dropout
+        logits1 = 0
+        logits2 = 0
+        for d in self.dropouts:
+            dropped = d(pooled)
+            l1 = self.classifier_lvl1(dropped)
+            l2 = self.classifier_lvl2(dropped)
+            logits1 += l1 / DROPOUT_SAMPLES
+            logits2 += l2 / DROPOUT_SAMPLES
+
+        # Soft-gating: use Level1 logits to guide Level2
+        soft_gate = torch.softmax(logits1, dim=1)
+        logits2 = logits2 + self.alpha * soft_gate[:, :logits2.size(1)]
+
         return logits1, logits2
 
 # ----------------------------
-#  Load + preprocess data
+# Load + preprocess data
 # ----------------------------
 df = pd.read_csv(CSV_PATH)
 df["text_full"] = df["title"].fillna("") + " " + df["content"].fillna("")
@@ -117,7 +131,7 @@ train_loader = DataLoader(train_ds, batch_size=BATCH_SIZE, shuffle=True)
 val_loader = DataLoader(val_ds, batch_size=BATCH_SIZE, shuffle=False)
 
 # ----------------------------
-#  Class weights for imbalance
+# Class weights
 # ----------------------------
 counts_lvl1 = np.bincount(y1_train)
 counts_lvl2 = np.bincount(y2_train)
@@ -128,18 +142,17 @@ criterion_lvl1 = nn.CrossEntropyLoss(weight=weight_lvl1)
 criterion_lvl2 = nn.CrossEntropyLoss(weight=weight_lvl2)
 
 # ----------------------------
-#  Initialize model + optimizer + scheduler
+# Initialize model, optimizer, scheduler
 # ----------------------------
 model = HierarchicalRoberta(
     num_labels_lvl1=len(le1.classes_),
     num_labels_lvl2=len(le2.classes_)
 ).to(DEVICE)
 
-# Separate LRs for backbone vs classifiers
 optimizer = AdamW([
-    {"params": model.roberta.parameters(), "lr": LR_BACKBONE},
-    {"params": model.classifier_lvl1.parameters(), "lr": LR_CLASSIFIER},
-    {"params": model.classifier_lvl2.parameters(), "lr": LR_CLASSIFIER},
+    {'params': model.roberta.parameters(), 'lr': BACKBONE_LR},
+    {'params': model.classifier_lvl1.parameters(), 'lr': CLASSIFIER_LR},
+    {'params': model.classifier_lvl2.parameters(), 'lr': CLASSIFIER_LR}
 ], weight_decay=WEIGHT_DECAY)
 
 total_steps = len(train_loader) * EPOCHS
@@ -149,10 +162,9 @@ scheduler = get_linear_schedule_with_warmup(
 )
 
 # ----------------------------
-#  Training + evaluation loop
+# Training + evaluation
 # ----------------------------
-best_f1w2 = 0.0
-
+best_f1 = 0
 for epoch in range(EPOCHS):
     model.train()
     running_loss = 0.0
@@ -167,18 +179,19 @@ for epoch in range(EPOCHS):
         loss1 = criterion_lvl1(logits1, labels1)
         loss2 = criterion_lvl2(logits2, labels2)
         loss = loss1 + loss2
-
         loss.backward()
+
+        # Gradient clipping
         torch.nn.utils.clip_grad_norm_(model.parameters(), GRAD_CLIP)
+
         optimizer.step()
         scheduler.step()
-
         running_loss += loss.item()
 
     avg_loss = running_loss / len(train_loader)
     print(f"Epoch {epoch+1} — avg training loss: {avg_loss:.4f}")
 
-    # Validation
+    # evaluation
     model.eval()
     all_p1, all_l1, all_p2, all_l2 = [], [], [], []
     with torch.no_grad():
@@ -202,11 +215,12 @@ for epoch in range(EPOCHS):
     acc2 = accuracy_score(all_l2, all_p2)
     f1w2 = f1_score(all_l2, all_p2, average='weighted')
     f1m2 = f1_score(all_l2, all_p2, average='macro')
-    print(f"Validation — Level1: acc {acc1:.4f}, F1w {f1w1:.4f}, F1m {f1m1:.4f}")
-    print(f"Validation — Level2: acc {acc2:.4f}, F1w {f1w2:.4f}, F1m {f1m2:.4f}")
+    print("** Validation results **")
+    print(f"Level1 — acc: {acc1:.4f}, F1‑weighted: {f1w1:.4f}, F1‑macro: {f1m1:.4f}")
+    print(f"Level2 — acc: {acc2:.4f}, F1‑weighted: {f1w2:.4f}, F1‑macro: {f1m2:.4f}")
 
-    # Save best model based on Level2 weighted F1
-    if f1w2 > best_f1w2:
-        best_f1w2 = f1w2
-        torch.save(model.state_dict(), "best_model.pth")
-        print(f"Saved best model at epoch {epoch+1} with Level2 weighted F1: {best_f1w2:.4f}")
+    # Save best model
+    if f1w2 > best_f1:
+        best_f1 = f1w2
+        torch.save(model.state_dict(), f"best_model.pt")
+        print(f"Saved best model at epoch {epoch+1} with Level2 weighted F1: {f1w2:.4f}")

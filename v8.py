@@ -5,8 +5,9 @@ import pandas as pd
 import torch
 from torch import nn
 from torch.utils.data import Dataset, DataLoader
-from transformers import AutoTokenizer, AutoModel, get_linear_schedule_with_warmup
+from transformers import AutoTokenizer, AutoModel, get_cosine_schedule_with_warmup
 from torch.optim import AdamW
+from torch.cuda.amp import autocast, GradScaler
 
 from sklearn.preprocessing import LabelEncoder
 from sklearn.model_selection import train_test_split
@@ -28,8 +29,9 @@ SEED = 42
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 CSV_PATH = "dataset/MN-DS-news-classification.csv"
 GRAD_CLIP = 1.0
-DROPOUT_SAMPLES = 5  # multi-sample dropout
-ALPHA = 0.5  # soft-gate weight
+DROPOUT_SAMPLES = 5
+ALPHA = 0.5
+LABEL_SMOOTHING = 0.1
 
 # ----------------------------
 # Set seeds
@@ -73,7 +75,7 @@ class NewsDataset(Dataset):
         }
 
 # ----------------------------
-# Hierarchical Model
+# Hierarchical Model with soft-gate fix
 # ----------------------------
 class HierarchicalRoberta(nn.Module):
     def __init__(self, num_labels_lvl1, num_labels_lvl2, pretrained_model=PRETRAINED_MODEL, dropout_prob=0.3):
@@ -84,12 +86,13 @@ class HierarchicalRoberta(nn.Module):
         self.classifier_lvl2 = nn.Linear(hidden_size, num_labels_lvl2)
         self.dropouts = nn.ModuleList([nn.Dropout(dropout_prob) for _ in range(DROPOUT_SAMPLES)])
         self.alpha = ALPHA
+        # Projection to match Level1 -> Level2 for soft-gate
+        self.proj_lvl1_to_lvl2 = nn.Linear(num_labels_lvl1, num_labels_lvl2)
 
     def forward(self, input_ids, attention_mask):
         outputs = self.roberta(input_ids=input_ids, attention_mask=attention_mask)
         pooled = outputs.last_hidden_state[:, 0, :]  # CLS token
 
-        # Multi-sample dropout
         logits1 = 0
         logits2 = 0
         for d in self.dropouts:
@@ -99,9 +102,10 @@ class HierarchicalRoberta(nn.Module):
             logits1 += l1 / DROPOUT_SAMPLES
             logits2 += l2 / DROPOUT_SAMPLES
 
-        # Soft-gating: use Level1 logits to guide Level2
+        # Soft-gating with projection
         soft_gate = torch.softmax(logits1, dim=1)
-        logits2 = logits2 + self.alpha * soft_gate[:, :logits2.size(1)]
+        soft_gate_proj = self.proj_lvl1_to_lvl2(soft_gate)
+        logits2 = logits2 + self.alpha * soft_gate_proj
 
         return logits1, logits2
 
@@ -131,18 +135,18 @@ train_loader = DataLoader(train_ds, batch_size=BATCH_SIZE, shuffle=True)
 val_loader = DataLoader(val_ds, batch_size=BATCH_SIZE, shuffle=False)
 
 # ----------------------------
-# Class weights
+# Class weights for imbalance
 # ----------------------------
 counts_lvl1 = np.bincount(y1_train)
 counts_lvl2 = np.bincount(y2_train)
 weight_lvl1 = torch.tensor(1.0 / (counts_lvl1 + 1e-6), dtype=torch.float).to(DEVICE)
 weight_lvl2 = torch.tensor(1.0 / (counts_lvl2 + 1e-6), dtype=torch.float).to(DEVICE)
 
-criterion_lvl1 = nn.CrossEntropyLoss(weight=weight_lvl1)
-criterion_lvl2 = nn.CrossEntropyLoss(weight=weight_lvl2)
+criterion_lvl1 = nn.CrossEntropyLoss(weight=weight_lvl1, label_smoothing=LABEL_SMOOTHING)
+criterion_lvl2 = nn.CrossEntropyLoss(weight=weight_lvl2, label_smoothing=LABEL_SMOOTHING)
 
 # ----------------------------
-# Initialize model, optimizer, scheduler
+# Initialize model, optimizer, scheduler, scaler
 # ----------------------------
 model = HierarchicalRoberta(
     num_labels_lvl1=len(le1.classes_),
@@ -152,17 +156,20 @@ model = HierarchicalRoberta(
 optimizer = AdamW([
     {'params': model.roberta.parameters(), 'lr': BACKBONE_LR},
     {'params': model.classifier_lvl1.parameters(), 'lr': CLASSIFIER_LR},
-    {'params': model.classifier_lvl2.parameters(), 'lr': CLASSIFIER_LR}
+    {'params': model.classifier_lvl2.parameters(), 'lr': CLASSIFIER_LR},
+    {'params': model.proj_lvl1_to_lvl2.parameters(), 'lr': CLASSIFIER_LR}
 ], weight_decay=WEIGHT_DECAY)
 
 total_steps = len(train_loader) * EPOCHS
 warmup_steps = int(WARMUP_RATIO * total_steps)
-scheduler = get_linear_schedule_with_warmup(
+scheduler = get_cosine_schedule_with_warmup(
     optimizer, num_warmup_steps=warmup_steps, num_training_steps=total_steps
 )
 
+scaler = GradScaler()  # AMP
+
 # ----------------------------
-# Training + evaluation
+# Training + evaluation loop
 # ----------------------------
 best_f1 = 0
 for epoch in range(EPOCHS):
@@ -175,23 +182,25 @@ for epoch in range(EPOCHS):
         labels1 = batch["label_lvl1"].to(DEVICE)
         labels2 = batch["label_lvl2"].to(DEVICE)
 
-        logits1, logits2 = model(input_ids, attention_mask)
-        loss1 = criterion_lvl1(logits1, labels1)
-        loss2 = criterion_lvl2(logits2, labels2)
-        loss = loss1 + loss2
-        loss.backward()
+        with autocast():  # mixed precision
+            logits1, logits2 = model(input_ids, attention_mask)
+            loss1 = criterion_lvl1(logits1, labels1)
+            loss2 = criterion_lvl2(logits2, labels2)
+            loss = loss1 + loss2
 
-        # Gradient clipping
+        scaler.scale(loss).backward()
+        scaler.unscale_(optimizer)
         torch.nn.utils.clip_grad_norm_(model.parameters(), GRAD_CLIP)
-
-        optimizer.step()
+        scaler.step(optimizer)
+        scaler.update()
         scheduler.step()
+
         running_loss += loss.item()
 
     avg_loss = running_loss / len(train_loader)
     print(f"Epoch {epoch+1} — avg training loss: {avg_loss:.4f}")
 
-    # evaluation
+    # Evaluation
     model.eval()
     all_p1, all_l1, all_p2, all_l2 = [], [], [], []
     with torch.no_grad():
@@ -219,7 +228,6 @@ for epoch in range(EPOCHS):
     print(f"Level1 — acc: {acc1:.4f}, F1‑weighted: {f1w1:.4f}, F1‑macro: {f1m1:.4f}")
     print(f"Level2 — acc: {acc2:.4f}, F1‑weighted: {f1w2:.4f}, F1‑macro: {f1m2:.4f}")
 
-    # Save best model
     if f1w2 > best_f1:
         best_f1 = f1w2
         torch.save(model.state_dict(), f"best_model.pt")

@@ -33,7 +33,7 @@ CSV_PATH = "./dataset/MN-DS-news-classification.csv"
 DROPOUTS = [0.1, 0.2, 0.3, 0.4, 0.5]
 
 # --------- Gradient accumulation setting (EDIT #3) ----------
-ACC_STEPS = 4  # BATCH_SIZE 8 * 4 = effective 32
+ACC_STEPS = 2  # BATCH_SIZE 8 * 4 = effective 32
 
 # ----------------------------
 # Seeds

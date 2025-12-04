@@ -17,8 +17,8 @@ from tqdm import tqdm
 # ----------------------------
 # Config / hyperparameters
 # ----------------------------
-PRETRAINED_MODEL = "microsoft/deberta-v3-large"  # <-- EDIT #1
-MAX_LEN = 384          # you can increase to 512 if GPU memory allows
+PRETRAINED_MODEL = "roberta-large"  # <-- EDIT #1
+MAX_LEN = 512          # you can increase to 512 if GPU memory allows
 BATCH_SIZE = 8
 EPOCHS = 15
 LR = 2e-5
@@ -33,7 +33,7 @@ CSV_PATH = "./dataset/MN-DS-news-classification.csv"
 DROPOUTS = [0.1, 0.2, 0.3, 0.4, 0.5]
 
 # --------- Gradient accumulation setting (EDIT #3) ----------
-ACC_STEPS = 2  # BATCH_SIZE 8 * 4 = effective 32
+ACC_STEPS = 4  # BATCH_SIZE 8 * 4 = effective 32
 
 # ----------------------------
 # Seeds

@@ -1,4 +1,4 @@
-# updated_hier_roberta_multidrop.py
+# updated_hier_roberta_multidrop_fp16_fix.py
 import os
 import random
 import numpy as np
@@ -102,7 +102,7 @@ class NewsDataset(Dataset):
         }
 
 # ----------------------------
-# Attention pooling (lightweight)
+# Attention pooling (lightweight) - SAFE for fp16 now
 # ----------------------------
 class AttentionPooling(nn.Module):
     def __init__(self, hidden_size):
@@ -110,10 +110,30 @@ class AttentionPooling(nn.Module):
         self.att = nn.Linear(hidden_size, 1)
 
     def forward(self, hidden_states, mask):
-        # hidden_states: (batch, seq_len, hidden)
-        # mask: (batch, seq_len) -- 1 for real tokens, 0 for padding
+        """
+        hidden_states: (batch, seq_len, hidden)
+        mask: (batch, seq_len) -- 1 for real tokens, 0 for padding
+        Works safely under autocast/float16 by using a dtype-appropriate fill value.
+        """
+        # ensure mask is on same device
+        mask = mask.to(device=hidden_states.device)
+
         scores = self.att(hidden_states).squeeze(-1)           # (batch, seq_len)
-        scores = scores.masked_fill(mask == 0, -1e9)          # mask padding
+
+        # boolean mask
+        mask_bool = mask.to(dtype=torch.bool)
+
+        # choose a safe large negative fill value compatible with scores dtype
+        # e.g., float16 min ~ -65504, so using torch.finfo(scores.dtype).min is safe
+        if scores.is_floating_point():
+            fill_value = torch.finfo(scores.dtype).min
+        else:
+            # fallback to a large negative float that will be cast
+            fill_value = -1e4
+
+        # masked_fill where mask == 0 (i.e., ~mask_bool)
+        scores = scores.masked_fill(~mask_bool, fill_value)
+
         weights = torch.softmax(scores, dim=1)                # (batch, seq_len)
         pooled = torch.sum(hidden_states * weights.unsqueeze(-1), dim=1)  # (batch, hidden)
         return pooled

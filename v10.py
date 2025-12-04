@@ -28,7 +28,7 @@ WARMUP_RATIO = 0.1
 SEED = 42
 GRAD_CLIP = 1.0
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-CSV_PATH = "./MN-DS-news-classification.csv"
+CSV_PATH = "./dataset/MN-DS-news-classification.csv"
 DROPOUTS = [0.1, 0.2, 0.3, 0.4, 0.5]
 
 # --------- Gradient accumulation setting (EDIT #3) ----------

@@ -39,7 +39,7 @@ DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 CSV_PATH = "./dataset/MN-DS-news-classification.csv"
 
 # Safer dropout ensemble (expanded)
-DROPOUTS = [0.05, 0.1, 0.15, 0.2, 0.25, 0.3, 0.4]
+DROPOUTS = [0.05, 0.1, 0.15, 0.2, 0.25, 0.3]
 
 # --------- Gradient accumulation setting ----------
 ACC_STEPS = 4  # effective batch size = BATCH_SIZE * ACC_STEPS

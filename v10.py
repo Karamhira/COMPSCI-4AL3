@@ -124,7 +124,7 @@ class NewsDataset(Dataset):
             "input_ids": input_ids,
             "attention_mask": attention_mask,
             "label_lvl1": torch.tensor(self.labels_lvl1[idx], dtype=torch.long),
-            "label_lvl2": torch.tensor(self.labels_lvl2[idx], dtype=t.long)
+            "label_lvl2": torch.tensor(self.labels_lvl2[idx], dtype=torch.long)  # FIXED: torch.long
         }
 
 # ----------------------------
@@ -276,7 +276,7 @@ weight_lvl2 = weight_lvl2 / weight_lvl2.mean()
 print(f"Level1 weight range: {weight_lvl1.min():.2f} - {weight_lvl1.max():.2f}")
 print(f"Level2 weight range: {weight_lvl2.min():.2f} - {weight_lvl2.max():.2f}")
 
-# Enhanced loss functions
+# Enhanced loss functions - using standard CrossEntropyLoss for stability
 criterion_lvl1 = nn.CrossEntropyLoss(weight=weight_lvl1, label_smoothing=0.15)
 criterion_lvl2 = nn.CrossEntropyLoss(weight=weight_lvl2, label_smoothing=0.15)
 
@@ -485,11 +485,11 @@ print("\nDetailed Level2 Classification Report:")
 print(classification_report(all_l2, all_p2, target_names=le2.classes_, digits=3))
 
 if acc1 >= 0.90 and acc2 >= 0.80:
-    print("🎯 TARGETS ACHIEVED!")
+    print("\n🎯 TARGETS ACHIEVED!")
 elif acc1 >= 0.88 and acc2 >= 0.75:
-    print("✅ Close to targets - consider training a bit longer")
+    print("\n✅ Close to targets - consider training a bit longer")
 else:
-    print("⚠️ Targets not reached - consider adjusting hyperparameters")
+    print("\n⚠️ Targets not reached - consider adjusting hyperparameters")
 
 # Save final model
 torch.save({

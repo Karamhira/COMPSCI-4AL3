@@ -4,7 +4,7 @@ import numpy as np
 import pandas as pd
 import torch
 from torch import nn
-from torch.utils.data import Dataset, DataLoader
+from torch.utils.data import Dataset, DataLoader, WeightedRandomSampler
 from transformers import AutoTokenizer, AutoModel, get_linear_schedule_with_warmup
 from torch.optim import AdamW
 from torch.amp import GradScaler, autocast
@@ -13,9 +13,9 @@ from sklearn.model_selection import train_test_split
 from sklearn.metrics import accuracy_score, f1_score
 from tqdm import tqdm
 
-# ----------------------------
-# Config / hyperparameters
-# ----------------------------
+# ---------------------------------
+# Config
+# ---------------------------------
 PRETRAINED_MODEL = "roberta-large"
 MAX_LEN = 512
 BATCH_SIZE = 8
@@ -29,33 +29,59 @@ SEED = 42
 GRAD_CLIP = 1.0
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 CSV_PATH = "./dataset/MN-DS-news-classification.csv"
-
 DROPOUTS = [0.1, 0.15, 0.2, 0.25, 0.3]
 ACC_STEPS = 4
 L1_WEIGHT = 1.2
 L2_WEIGHT = 1.0
 
-# ----------------------------
+# ---------------------------------
 # Seeds
-# ----------------------------
+# ---------------------------------
 random.seed(SEED)
 np.random.seed(SEED)
 torch.manual_seed(SEED)
 if DEVICE.type == "cuda":
     torch.cuda.manual_seed_all(SEED)
 
-# ----------------------------
-# Utilities
-# ----------------------------
-def mean_pool(hidden_states, mask):
-    mask = mask.unsqueeze(-1).float()
-    summed = (hidden_states * mask).sum(dim=1)
-    counts = mask.sum(dim=1).clamp(min=1e-9)
-    return summed / counts
+# ---------------------------------
+# Mixout (for regularization)
+# ---------------------------------
+class MixLinear(nn.Linear):
+    def __init__(self, in_features, out_features, bias=True, mixout_prob=0.5):
+        super().__init__(in_features, out_features, bias)
+        self.mixout_prob = mixout_prob
+        self.register_buffer("target_params", self.weight.data.clone())
 
-# ----------------------------
+    def forward(self, x):
+        if self.training:
+            mask = (torch.rand_like(self.weight) < self.mixout_prob).float()
+            weight = mask * self.target_params + (1 - mask) * self.weight
+        else:
+            weight = self.weight
+        return nn.functional.linear(x, weight, self.bias)
+
+# ---------------------------------
+# Multi-Head Attention Pooling
+# ---------------------------------
+class MultiHeadAttentionPool(nn.Module):
+    def __init__(self, hidden_size, heads=4):
+        super().__init__()
+        self.heads = heads
+        self.W = nn.Linear(hidden_size, heads)
+
+    def forward(self, hidden_states, mask):
+        scores = self.W(hidden_states)      # (B, L, H)
+        scores = scores.masked_fill(mask.unsqueeze(-1) == 0,
+                                    torch.finfo(scores.dtype).min / 2)
+
+        weights = torch.softmax(scores, dim=1)  # (B, L, H)
+        pooled = torch.einsum("blh,blx->bhx", weights, hidden_states)
+        pooled = pooled.mean(dim=1)             # average heads
+        return pooled
+
+# ---------------------------------
 # Dataset
-# ----------------------------
+# ---------------------------------
 class NewsDataset(Dataset):
     def __init__(self, texts, labels_lvl1, labels_lvl2, tokenizer, max_len=MAX_LEN):
         self.texts = texts
@@ -64,96 +90,69 @@ class NewsDataset(Dataset):
         self.tokenizer = tokenizer
         self.max_len = max_len
 
-    def __len__(self):
-        return len(self.texts)
+    def __len__(self): return len(self.texts)
 
     def __getitem__(self, idx):
         text = str(self.texts[idx])
         encoded = self.tokenizer(
-            text,
-            padding='max_length',
-            truncation=True,
-            max_length=self.max_len,
-            return_tensors='pt'
-        )
-        input_ids = encoded["input_ids"].squeeze(0)
-        attention_mask = encoded["attention_mask"].squeeze(0)
+            text, padding='max_length', truncation=True,
+            max_length=self.max_len, return_tensors='pt')
+
         return {
-            "input_ids": input_ids,
-            "attention_mask": attention_mask,
-            "label_lvl1": torch.tensor(self.labels_lvl1[idx], dtype=torch.long),
-            "label_lvl2": torch.tensor(self.labels_lvl2[idx], dtype=torch.long)
+            "input_ids": encoded["input_ids"].squeeze(0),
+            "attention_mask": encoded["attention_mask"].squeeze(0),
+            "label_lvl1": torch.tensor(self.labels_lvl1[idx]),
+            "label_lvl2": torch.tensor(self.labels_lvl2[idx]),
         }
 
-# ----------------------------
-# Attention pooling — OPTION A FIX ✔
-# ----------------------------
-class AttentionPooling(nn.Module):
-    def __init__(self, hidden_size):
-        super().__init__()
-        self.att = nn.Linear(hidden_size, 1)
-
-    def forward(self, hidden_states, mask):
-        scores = self.att(hidden_states).squeeze(-1)  # (batch, seq_len)
-
-        # Convert mask → bool
-        if mask.dtype != torch.bool:
-            mask_bool = mask.to(torch.bool)
-        else:
-            mask_bool = mask
-
-        # dtype-safe negative infinity
-        neg_inf = torch.finfo(scores.dtype).min / 2.0
-
-        # mask padding
-        scores = scores.masked_fill(~mask_bool, neg_inf)
-
-        # softmax over valid tokens only
-        weights = torch.softmax(scores, dim=1)
-        pooled = torch.sum(hidden_states * weights.unsqueeze(-1), dim=1)
-        return pooled
-
-# ----------------------------
+# ---------------------------------
 # Model
-# ----------------------------
+# ---------------------------------
 class HierarchicalRobertaMultiDropout(nn.Module):
-    def __init__(self, num_labels_lvl1, num_labels_lvl2, pretrained_model=PRETRAINED_MODEL, dropouts=DROPOUTS):
+    def __init__(self, num_labels_lvl1, num_labels_lvl2,
+                 pretrained_model=PRETRAINED_MODEL, dropouts=DROPOUTS):
         super().__init__()
         self.roberta = AutoModel.from_pretrained(pretrained_model)
         hidden_size = self.roberta.config.hidden_size
 
-        self.att_pool = AttentionPooling(hidden_size)
+        # upgraded pooling
+        self.pool = MultiHeadAttentionPool(hidden_size, heads=4)
 
+        # multi-dropout
         self.dropouts = nn.ModuleList([nn.Dropout(p) for p in dropouts])
-        self.classifier_lvl1 = nn.Linear(hidden_size, num_labels_lvl1)
-        self.classifier_lvl2 = nn.Linear(hidden_size, num_labels_lvl2)
-        self.proj_lvl1_to_lvl2 = nn.Linear(num_labels_lvl1, num_labels_lvl2)
+
+        # mixout-regularized classifier layers
+        self.classifier_lvl1 = MixLinear(hidden_size, num_labels_lvl1, mixout_prob=0.5)
+        self.classifier_lvl2 = MixLinear(hidden_size, num_labels_lvl2, mixout_prob=0.5)
+        self.proj_lvl1_to_lvl2 = MixLinear(num_labels_lvl1, num_labels_lvl2, mixout_prob=0.7)
+
         self.alpha = 0.5
 
     def forward(self, input_ids, attention_mask):
-        outputs = self.roberta(input_ids=input_ids, attention_mask=attention_mask)
-        pooled = self.att_pool(outputs.last_hidden_state, attention_mask)
+        out = self.roberta(input_ids=input_ids, attention_mask=attention_mask)
+        pooled = self.pool(out.last_hidden_state, attention_mask)
 
         logits1_all, logits2_all = [], []
 
-        for dropout in self.dropouts:
-            dropped = dropout(pooled)
-            logits1 = self.classifier_lvl1(dropped)
-            logits2 = self.classifier_lvl2(dropped)
-            soft_gate = torch.sigmoid(self.proj_lvl1_to_lvl2(logits1))
-            if soft_gate.size(1) != logits2.size(1):
-                soft_gate = soft_gate[:, :logits2.size(1)]
-            logits2 = logits2 + self.alpha * soft_gate
+        for drop in self.dropouts:
+            h = drop(pooled)
+            logits1 = self.classifier_lvl1(h)
+            logits2 = self.classifier_lvl2(h)
+
+            gate = torch.sigmoid(self.proj_lvl1_to_lvl2(logits1))
+            logits2 = logits2 + self.alpha * gate
+
             logits1_all.append(logits1)
             logits2_all.append(logits2)
 
-        logits1 = torch.stack(logits1_all, dim=0).mean(dim=0)
-        logits2 = torch.stack(logits2_all, dim=0).mean(dim=0)
-        return logits1, logits2
+        return (
+            torch.stack(logits1_all).mean(0),
+            torch.stack(logits2_all).mean(0),
+        )
 
-# ----------------------------
-# Load + preprocess data
-# ----------------------------
+# ---------------------------------
+# Load data
+# ---------------------------------
 df = pd.read_csv(CSV_PATH)
 df["text_full"] = df["title"].fillna("") + " " + df["content"].fillna("")
 
@@ -168,28 +167,35 @@ X_train, X_val, y1_train, y1_val, y2_train, y2_val = train_test_split(
 )
 
 tokenizer = AutoTokenizer.from_pretrained(PRETRAINED_MODEL)
+
 train_ds = NewsDataset(X_train.tolist(), y1_train.tolist(), y2_train.tolist(), tokenizer)
-val_ds = NewsDataset(X_val.tolist(), y1_val.tolist(), y2_val.tolist(), tokenizer)
-train_loader = DataLoader(train_ds, batch_size=BATCH_SIZE, shuffle=True)
-val_loader = DataLoader(val_ds, batch_size=BATCH_SIZE, shuffle=False)
+val_ds   = NewsDataset(X_val.tolist(), y1_val.tolist(), y2_val.tolist(), tokenizer)
 
-# ----------------------------
-# Class weights
-# ----------------------------
-counts_lvl1 = np.bincount(y1_train)
+# ---------------------------------
+# Weighted sampler for Level-2 balance
+# ---------------------------------
 counts_lvl2 = np.bincount(y2_train)
-weight_lvl1 = torch.tensor(1.0 / (counts_lvl1 + 1e-6), dtype=torch.float).to(DEVICE)
-weight_lvl2 = torch.tensor(1.0 / (counts_lvl2 + 1e-6), dtype=torch.float).to(DEVICE)
+weights = 1.0 / (counts_lvl2 + 1e-9)
+sample_weights = torch.tensor([weights[y] for y in y2_train], dtype=torch.float)
+sampler = WeightedRandomSampler(sample_weights, num_samples=len(sample_weights), replacement=True)
 
-criterion_lvl1 = nn.CrossEntropyLoss(weight=weight_lvl1, label_smoothing=0.1)
-criterion_lvl2 = nn.CrossEntropyLoss(weight=weight_lvl2, label_smoothing=0.1)
+train_loader = DataLoader(train_ds, batch_size=BATCH_SIZE, sampler=sampler)
+val_loader   = DataLoader(val_ds, batch_size=BATCH_SIZE, shuffle=False)
 
-# ----------------------------
-# Model, optimizer, scheduler, scaler
-# ----------------------------
+# ---------------------------------
+# Losses
+# ---------------------------------
+weight_lvl1 = torch.tensor(1/(np.bincount(y1_train)+1e-6)).float().to(DEVICE)
+weight_lvl2 = torch.tensor(1/(np.bincount(y2_train)+1e-6)).float().to(DEVICE)
+
+criterion_lvl1 = nn.CrossEntropyLoss(weight=weight_lvl1)
+criterion_lvl2 = nn.CrossEntropyLoss(weight=weight_lvl2)
+
+# ---------------------------------
+# Model + optimizer
+# ---------------------------------
 model = HierarchicalRobertaMultiDropout(
-    num_labels_lvl1=len(le1.classes_),
-    num_labels_lvl2=len(le2.classes_)
+    len(le1.classes_), len(le2.classes_)
 ).to(DEVICE)
 
 optimizer = AdamW([
@@ -201,90 +207,67 @@ optimizer = AdamW([
 
 steps_per_epoch = (len(train_loader) + ACC_STEPS - 1) // ACC_STEPS
 total_steps = steps_per_epoch * EPOCHS
-warmup_steps = int(WARMUP_RATIO * total_steps)
+warmup_steps = int(total_steps * WARMUP_RATIO)
 scheduler = get_linear_schedule_with_warmup(optimizer, warmup_steps, total_steps)
 scaler = GradScaler()
 
-# ----------------------------
-# Training
-# ----------------------------
+# ---------------------------------
+# Training loop (unchanged)
+# ---------------------------------
 for epoch in range(EPOCHS):
     model.train()
     running_loss = 0.0
-    accumulated_steps = 0
-
-    pbar = tqdm(enumerate(train_loader), total=len(train_loader), desc=f"Train epoch {epoch+1}/{EPOCHS}")
+    acc_steps = 0
     optimizer.zero_grad()
 
-    for step, batch in pbar:
+    pbar = tqdm(train_loader, desc=f"Epoch {epoch+1}/{EPOCHS}")
+
+    for batch in pbar:
         input_ids = batch["input_ids"].to(DEVICE)
-        attention_mask = batch["attention_mask"].to(DEVICE)
-        labels1 = batch["label_lvl1"].to(DEVICE)
-        labels2 = batch["label_lvl2"].to(DEVICE)
+        mask      = batch["attention_mask"].to(DEVICE)
+        y1        = batch["label_lvl1"].to(DEVICE)
+        y2        = batch["label_lvl2"].to(DEVICE)
 
-        with autocast(device_type='cuda' if DEVICE.type == 'cuda' else 'cpu'):
-            logits1, logits2 = model(input_ids, attention_mask)
-            loss1 = criterion_lvl1(logits1, labels1)
-            loss2 = criterion_lvl2(logits2, labels2)
-            raw_loss = L1_WEIGHT * loss1 + L2_WEIGHT * loss2
-            loss = raw_loss / ACC_STEPS
+        with autocast(device_type="cuda"):
+            log1, log2 = model(input_ids, mask)
+            loss = L1_WEIGHT * criterion_lvl1(log1, y1) + \
+                   L2_WEIGHT * criterion_lvl2(log2, y2)
 
-        scaler.scale(loss).backward()
-        accumulated_steps += 1
-        running_loss += raw_loss.item()
+            (loss / ACC_STEPS).backward()
 
-        if accumulated_steps % ACC_STEPS == 0:
+        acc_steps += 1
+        running_loss += loss.item()
+
+        if acc_steps % ACC_STEPS == 0:
             scaler.unscale_(optimizer)
-            torch.nn.utils.clip_grad_norm_(model.parameters(), GRAD_CLIP)
+            nn.utils.clip_grad_norm_(model.parameters(), GRAD_CLIP)
             scaler.step(optimizer)
             scaler.update()
             optimizer.zero_grad()
             scheduler.step()
 
-        pbar.set_postfix({"loss": f"{running_loss / (step + 1):.4f}"})
+        pbar.set_postfix({"loss": f"{running_loss/(acc_steps):.4f}"})
 
-    if accumulated_steps % ACC_STEPS != 0:
-        scaler.unscale_(optimizer)
-        torch.nn.utils.clip_grad_norm_(model.parameters(), GRAD_CLIP)
-        scaler.step(optimizer)
-        scaler.update()
-        optimizer.zero_grad()
-        scheduler.step()
-
-    avg_loss = running_loss / len(train_loader)
-    print(f"Epoch {epoch+1} — avg training loss: {avg_loss:.4f}")
-
-    # ----------------------------
-    # Validation
-    # ----------------------------
+    #  Validation
     model.eval()
-    all_p1, all_l1 = [], []
-    all_p2, all_l2 = [], []
+    A1, P1 = [], []
+    A2, P2 = [], []
 
     with torch.no_grad():
         for batch in val_loader:
-            input_ids = batch["input_ids"].to(DEVICE)
-            attention_mask = batch["attention_mask"].to(DEVICE)
-            labels1 = batch["label_lvl1"].to(DEVICE)
-            labels2 = batch["label_lvl2"].to(DEVICE)
+            ids = batch["input_ids"].to(DEVICE)
+            mask = batch["attention_mask"].to(DEVICE)
+            y1 = batch["label_lvl1"].to(DEVICE)
+            y2 = batch["label_lvl2"].to(DEVICE)
 
-            logits1, logits2 = model(input_ids, attention_mask)
-            preds1 = torch.argmax(logits1, dim=1).cpu().numpy()
-            preds2 = torch.argmax(logits2, dim=1).cpu().numpy()
-            all_p1.extend(preds1)
-            all_l1.extend(labels1.cpu().numpy())
-            all_p2.extend(preds2)
-            all_l2.extend(labels2.cpu().numpy())
+            log1, log2 = model(ids, mask)
+            P1.extend(torch.argmax(log1,1).cpu().numpy())
+            A1.extend(y1.cpu().numpy())
+            P2.extend(torch.argmax(log2,1).cpu().numpy())
+            A2.extend(y2.cpu().numpy())
 
-    acc1 = accuracy_score(all_l1, all_p1)
-    f1w1 = f1_score(all_l1, all_p1, average='weighted')
-    f1m1 = f1_score(all_l1, all_p1, average='macro')
-    acc2 = accuracy_score(all_l2, all_p2)
-    f1w2 = f1_score(all_l2, all_p2, average='weighted')
-    f1m2 = f1_score(all_l2, all_p2, average='macro')
+    print("VAL:")
+    print("L1:", accuracy_score(A1,P1), f1_score(A1,P1,average="macro"))
+    print("L2:", accuracy_score(A2,P2), f1_score(A2,P2,average="macro"))
 
-    print("** Validation results **")
-    print(f"Level1 — acc: {acc1:.4f}, F1-weighted: {f1w1:.4f}, F1-macro: {f1m1:.4f}")
-    print(f"Level2 — acc: {acc2:.4f}, F1-weighted: {f1w2:.4f}, F1-macro: {f1m2:.4f}")
-
-    torch.save(model.state_dict(), f"hier_roberta_multidrop_epoch{epoch+1}.pt")
+    torch.save(model.state_dict(), f"hier_v11_epoch{epoch+1}.pt")

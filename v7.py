@@ -409,14 +409,13 @@ def main(args):
 
     # run training
     trainer.train()
-
     # final eval
     metrics = trainer.evaluate(eval_dataset=val_ds)
     print("FINAL EVAL METRICS:", metrics)
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
-    parser.add_argument("--data_csv", type=str, default="./dataset/mn_ds_data.csv")
+    parser.add_argument("--data_csv", type=str, default="./dataset/MN-DS-news-classification.csv")
     parser.add_argument("--model_name", type=str, default="roberta-base")
     parser.add_argument("--output_dir", type=str, default="./roberta_mnds_model")
     parser.add_argument("--text_col", type=str, default="text")

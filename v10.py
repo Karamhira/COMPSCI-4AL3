@@ -1,6 +1,3 @@
-!pip install --upgrade pip
-!pip install "transformers==4.44.2" "accelerate>=0.30.0" "torch==2.3.0"
-
 import os
 import random
 import numpy as np

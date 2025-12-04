@@ -105,7 +105,6 @@ class HierarchicalRobertaMultiDropout(nn.Module):
             logits1_all.append(logits1)
             logits2_all.append(logits2)
 
-        # average over multiple dropouts
         logits1 = torch.stack(logits1_all, dim=0).mean(dim=0)
         logits2 = torch.stack(logits2_all, dim=0).mean(dim=0)
         return logits1, logits2
@@ -176,7 +175,7 @@ for epoch in range(EPOCHS):
         labels1 = batch["label_lvl1"].to(DEVICE)
         labels2 = batch["label_lvl2"].to(DEVICE)
 
-        with autocast(device_type='cuda' if DEVICE.type == 'cuda' else 'cpu'):
+        with autocast():
             logits1, logits2 = model(input_ids, attention_mask)
             loss1 = criterion_lvl1(logits1, labels1)
             loss2 = criterion_lvl2(logits2, labels2)
@@ -185,9 +184,9 @@ for epoch in range(EPOCHS):
         scaler.scale(loss).backward()
         scaler.unscale_(optimizer)
         torch.nn.utils.clip_grad_norm_(model.parameters(), GRAD_CLIP)
-        scaler.step(optimizer)  # handles optimizer.step()
+        scaler.step(optimizer)  # optimizer step handled
         scaler.update()
-        scheduler.step()        # called after optimizer update
+        scheduler.step()        # called AFTER optimizer update to fix warning
 
         running_loss += loss.item()
 

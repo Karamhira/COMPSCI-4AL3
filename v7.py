@@ -3,24 +3,24 @@ import argparse
 from typing import List, Dict
 
 import numpy as np
-import pandas as pd
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from torch.utils.data import Dataset
+from torch.utils.data import DataLoader
 
-from datasets import Dataset as HFDataset
+import pandas as pd
+from datasets import Dataset
 from transformers import (
     RobertaModel, RobertaTokenizerFast, AutoConfig,
-    Trainer, TrainingArguments, default_data_collator, EvalPrediction
+    Trainer, TrainingArguments, EvalPrediction, default_data_collator
 )
 from sklearn.metrics import accuracy_score, f1_score, precision_score, recall_score
 
 # ---------------------------
-# Utility: Focal Loss
+# Utilities
 # ---------------------------
 class FocalLoss(nn.Module):
-    """Multi-class focal loss."""
+    """Multi-class focal loss (generalized)."""
     def __init__(self, gamma=2.0, weight=None, reduction='mean', eps=1e-8):
         super().__init__()
         self.gamma = gamma
@@ -37,7 +37,8 @@ class FocalLoss(nn.Module):
             return loss.mean()
         elif self.reduction == 'sum':
             return loss.sum()
-        return loss
+        else:
+            return loss
 
 def compute_class_weights(labels: List[int], num_classes: int) -> torch.Tensor:
     counts = np.bincount(labels, minlength=num_classes).astype(np.float32)
@@ -46,7 +47,6 @@ def compute_class_weights(labels: List[int], num_classes: int) -> torch.Tensor:
     return torch.tensor(weights, dtype=torch.float)
 
 def get_layerwise_lr_decay_param_groups(model: nn.Module, base_lr: float, layer_decay: float) -> List[Dict]:
-    """Layer-wise LR decay for HuggingFace RoBERTa."""
     param_groups = {}
     num_layers = len(list(model.roberta.encoder.layer))
     head_names = ["level1_head", "level2_head"]
@@ -70,14 +70,10 @@ def get_layerwise_lr_decay_param_groups(model: nn.Module, base_lr: float, layer_
         if key not in param_groups:
             param_groups[key] = {"params": [], "lr_scale": key}
         param_groups[key]["params"].append(param)
-
-    groups_list = []
-    for lr_scale, group in sorted(param_groups.items(), key=lambda x: x[0]):
-        groups_list.append({"params": group["params"], "lr": base_lr * lr_scale})
-    return groups_list
+    return [{"params": g["params"], "lr": base_lr * g["lr_scale"]} for g in sorted(param_groups.items(), key=lambda x: x[0])]
 
 # ---------------------------
-# Model: RoBERTa with two heads + multi-dropout
+# Model: RoBERTa with 2 heads + multi-sample dropout
 # ---------------------------
 class RobertaTwoHeadMultiDropout(nn.Module):
     def __init__(self, model_name_or_path: str, num_labels_level1: int, num_labels_level2: int,
@@ -97,7 +93,6 @@ class RobertaTwoHeadMultiDropout(nn.Module):
 
         self.level1_head = nn.Linear(hidden_size, num_labels_level1)
         self.level2_head = nn.Linear(hidden_size, num_labels_level2)
-
         nn.init.normal_(self.level1_head.weight, std=0.02)
         nn.init.normal_(self.level2_head.weight, std=0.02)
 
@@ -119,18 +114,16 @@ class RobertaTwoHeadMultiDropout(nn.Module):
         if labels is not None:
             l1 = labels.get("level1", None)
             l2 = labels.get("level2", None)
-            # level1 CE
             if l1 is not None:
-                loss1 = F.cross_entropy(level1_logits, l1, weight=labels.get("level1_weight", None).to(level1_logits.device) if labels.get("level1_weight", None) is not None else None)
+                loss1 = nn.CrossEntropyLoss(weight=labels.get("level1_weight", None).to(level1_logits.device) if labels.get("level1_weight", None) is not None else None)(level1_logits, l1)
             else:
                 loss1 = torch.tensor(0.0, device=level1_logits.device)
-            # level2 focal
             if l2 is not None:
                 focal = labels.get("level2_focal", None)
                 if focal is not None:
                     loss2 = focal(level2_logits, l2)
                 else:
-                    loss2 = F.cross_entropy(level2_logits, l2, weight=labels.get("level2_weight", None).to(level2_logits.device) if labels.get("level2_weight", None) is not None else None)
+                    loss2 = nn.CrossEntropyLoss(weight=labels.get("level2_weight", None).to(level2_logits.device) if labels.get("level2_weight", None) is not None else None)(level2_logits, l2)
             else:
                 loss2 = torch.tensor(0.0, device=level2_logits.device)
             alpha = labels.get("alpha", 0.4)
@@ -145,18 +138,18 @@ class RobertaTwoHeadMultiDropout(nn.Module):
         }
 
 # ---------------------------
-# Dataset preparation
+# Dataset helpers
 # ---------------------------
-def prepare_dataset(tokenizer, df, text_column='content', title_column='title', max_length=256):
-    if title_column:
+def prepare_dataset(tokenizer, df, text_column='content', title_column=None, max_length=256):
+    if title_column and title_column in df.columns:
         texts = (df[title_column].fillna("") + ". " + df[text_column].fillna("")).tolist()
     else:
         texts = df[text_column].fillna("").tolist()
     enc = tokenizer(texts, truncation=True, padding='max_length', max_length=max_length)
     enc = {k: np.array(v) for k, v in enc.items()}
-    enc['labels_level1'] = df['level1'].to_numpy()
-    enc['labels_level2'] = df['level2'].to_numpy()
-    return HFDataset.from_dict(enc)
+    enc['labels_level1'] = df['category_level_1'].to_numpy()
+    enc['labels_level2'] = df['category_level_2'].to_numpy()
+    return Dataset.from_dict(enc)
 
 def collate_fn(batch):
     collated = default_data_collator(batch)
@@ -166,9 +159,6 @@ def collate_fn(batch):
     }
     return collated
 
-# ---------------------------
-# Metrics
-# ---------------------------
 def compute_metrics(eval_pred: EvalPrediction) -> Dict[str, float]:
     logits_level1, logits_level2 = eval_pred.predictions
     labels_level1 = eval_pred.label_ids['level1']
@@ -180,35 +170,36 @@ def compute_metrics(eval_pred: EvalPrediction) -> Dict[str, float]:
         "level1_accuracy": accuracy_score(labels_level1, preds1),
         "level1_micro_f1": f1_score(labels_level1, preds1, average='micro', zero_division=0),
         "level1_macro_f1": f1_score(labels_level1, preds1, average='macro', zero_division=0),
+        "level1_precision_macro": precision_score(labels_level1, preds1, average='macro', zero_division=0),
+        "level1_recall_macro": recall_score(labels_level1, preds1, average='macro', zero_division=0),
         "level2_accuracy": accuracy_score(labels_level2, preds2),
         "level2_micro_f1": f1_score(labels_level2, preds2, average='micro', zero_division=0),
-        "level2_macro_f1": f1_score(labels_level2, preds2, average='macro', zero_division=0)
+        "level2_macro_f1": f1_score(labels_level2, preds2, average='macro', zero_division=0),
+        "level2_precision_macro": precision_score(labels_level2, preds2, average='macro', zero_division=0),
+        "level2_recall_macro": recall_score(labels_level2, preds2, average='macro', zero_division=0)
     }
     return metrics
 
 # ---------------------------
-# Main training
+# Main
 # ---------------------------
 def main(args):
     tokenizer = RobertaTokenizerFast.from_pretrained(args.model_name)
     df = pd.read_csv(args.data_csv)
-
-    # MN-DS columns fix
-    if "level1_category" in df.columns:
-        df["level1"] = df["level1_category"]
-    if "level2_category" in df.columns:
-        df["level2"] = df["level2_category"]
+    
+    # Ensure columns exist
+    assert 'category_level_1' in df.columns and 'category_level_2' in df.columns, \
+        "CSV must have 'category_level_1' and 'category_level_2' columns"
 
     dataset = prepare_dataset(tokenizer, df, text_column=args.text_col, title_column=args.title_col, max_length=args.max_length)
-
-    ds = dataset.train_test_split(test_size=args.val_ratio, seed=args.seed)
-    train_ds = ds['train']
-    val_ds = ds['test']
+    ds_split = dataset.train_test_split(test_size=args.val_ratio, seed=args.seed)
+    train_ds, val_ds = ds_split['train'], ds_split['test']
 
     # Class weights
     level1_weights = compute_class_weights(train_ds['labels_level1'], args.num_labels_level1)
     level2_weights = compute_class_weights(train_ds['labels_level2'], args.num_labels_level2)
 
+    # Model
     model = RobertaTwoHeadMultiDropout(
         model_name_or_path=args.model_name,
         num_labels_level1=args.num_labels_level1,
@@ -243,7 +234,6 @@ def main(args):
         dataloader_pin_memory=True
     )
 
-    # Wrap model for Trainer
     class WrappedModel(nn.Module):
         def __init__(self, model, level1_weights, level2_weights, alpha=0.4, beta=0.6, focal_gamma=2.0):
             super().__init__()
@@ -256,6 +246,7 @@ def main(args):
 
         def forward(self, **kwargs):
             labels = kwargs.get('labels', None)
+            labels_payload = None
             if labels is not None:
                 labels_payload = {
                     "level1": labels['level1'],
@@ -265,9 +256,8 @@ def main(args):
                     "alpha": self.alpha,
                     "beta": self.beta
                 }
-            else:
-                labels_payload = None
-            out = self.model(input_ids=kwargs.get('input_ids'), attention_mask=kwargs.get('attention_mask'),
+            out = self.model(input_ids=kwargs.get('input_ids', None),
+                             attention_mask=kwargs.get('attention_mask', None),
                              labels=labels_payload)
             return out["loss"]
 
@@ -277,27 +267,29 @@ def main(args):
         def compute_loss(self, model, inputs, return_outputs=False):
             labels = inputs.pop('labels')
             device = next(model.parameters()).device
+            labels_device = {"level1": labels["level1"].to(device), "level2": labels["level2"].to(device)}
             out = model.model(input_ids=inputs.get('input_ids'), attention_mask=inputs.get('attention_mask'),
-                              labels={
-                                  "level1": labels["level1"].to(device),
-                                  "level2": labels["level2"].to(device),
-                                  "level1_weight": level1_weights.to(device),
-                                  "level2_focal": FocalLoss(gamma=args.focal_gamma, weight=level2_weights.to(device)),
-                                  "alpha": args.alpha,
-                                  "beta": args.beta
-                              })
+                              labels={"level1": labels_device["level1"],
+                                      "level2": labels_device["level2"],
+                                      "level1_weight": level1_weights.to(device),
+                                      "level2_focal": FocalLoss(gamma=args.focal_gamma, weight=level2_weights.to(device)),
+                                      "alpha": args.alpha,
+                                      "beta": args.beta})
             loss = out['loss']
             return (loss, out) if return_outputs else loss
 
         def prediction_step(self, model, inputs, prediction_loss_only, ignore_keys=None):
-            labels = inputs.pop("labels", None)
+            has_labels = "labels" in inputs and inputs["labels"] is not None
+            labels = inputs.pop("labels") if has_labels else None
             out = model.model(input_ids=inputs.get('input_ids'), attention_mask=inputs.get('attention_mask'))
-            l1_logits = out['logits_level1'].detach().cpu().numpy()
-            l2_logits = out['logits_level2'].detach().cpu().numpy()
-            if labels is not None:
-                return None, (np.stack([l1_logits, l2_logits], axis=0)), {"level1": labels['level1'].numpy(), "level2": labels['level2'].numpy()}
+            level1_logits = out['logits_level1'].detach().cpu().numpy()
+            level2_logits = out['logits_level2'].detach().cpu().numpy()
+            if has_labels:
+                label_level1 = labels['level1'].numpy()
+                label_level2 = labels['level2'].numpy()
+                return None, (np.stack([level1_logits, level2_logits], axis=0)), {"level1": label_level1, "level2": label_level2}
             else:
-                return None, (np.stack([l1_logits, l2_logits], axis=0)), None
+                return None, (np.stack([level1_logits, level2_logits], axis=0)), None
 
     trainer = TwoHeadTrainer(
         model=wrapped,
@@ -314,14 +306,12 @@ def main(args):
     metrics = trainer.evaluate(eval_dataset=val_ds)
     print("FINAL EVAL METRICS:", metrics)
 
-# ---------------------------
-# Argument Parser
-# ---------------------------
+
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
-    parser.add_argument("--data_csv", type=str, default="./dataset/MN-DS-news-classification.csv")
+    parser.add_argument("--data_csv", type=str, default="./dataset/news_data.csv")
     parser.add_argument("--model_name", type=str, default="roberta-base")
-    parser.add_argument("--output_dir", type=str, default="./roberta_mnds_model")
+    parser.add_argument("--output_dir", type=str, default="./roberta_news_model")
     parser.add_argument("--text_col", type=str, default="content")
     parser.add_argument("--title_col", type=str, default="title")
     parser.add_argument("--max_length", type=int, default=256)
@@ -348,5 +338,4 @@ if __name__ == "__main__":
     parser.add_argument("--report_to", type=str, default=None)
     parser.add_argument("--metric_for_best_model", type=str, default="level2_macro_f1")
     args = parser.parse_args()
-
     main(args)

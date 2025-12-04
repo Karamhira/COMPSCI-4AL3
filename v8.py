@@ -166,7 +166,7 @@ scheduler = get_linear_schedule_with_warmup(
     optimizer, num_warmup_steps=warmup_steps, num_training_steps=total_steps
 )
 
-scaler = GradScaler(device_type='cuda' if DEVICE.type == 'cuda' else 'cpu')
+scaler = GradScaler()
 
 # ----------------------------
 # Training + evaluation
@@ -182,7 +182,7 @@ for epoch in range(EPOCHS):
         labels1 = batch["label_lvl1"].to(DEVICE)
         labels2 = batch["label_lvl2"].to(DEVICE)
 
-        with autocast(device_type='cuda' if DEVICE.type == 'cuda' else 'cpu'):
+        with autocast():
             logits1, logits2 = model(input_ids, attention_mask)
             loss1 = criterion_lvl1(logits1, labels1)
             loss2 = criterion_lvl2(logits2, labels2)
